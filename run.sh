@@ -1,24 +1,27 @@
 #!/bin/sh
-# The two-minute demo.
+# The demo.
 cd "$(dirname "$0")"
-[ -x bin/dbd ] || ./build.sh
+[ -x bin/top ] || ./build.sh
 
 case "$1" in
 alone)
   echo "Each binary is complete by itself. No owner, no segment, no peers."
   echo "  ./bin/webd            # then: curl localhost:8080/bump"
   echo "  ./bin/gui             # then: click bump"
-  echo "Their counts are private to each process."
+  ;;
+top)
+  ./bin/top                     # dashboard alone; tolerates an absent owner
   ;;
 *)
   trap 'kill 0' EXIT INT TERM
-  ./bin/dbd &                 sleep 0.5
-  ./bin/webd --join &         sleep 0.4
+  ./bin/dbd &           sleep 0.5
+  ./bin/webd --join &   sleep 0.3
+  ./bin/gui  --join &   sleep 0.3
   echo ""
-  echo "  curl localhost:8080/bump   -> watch the number change in the window"
-  echo "  click bump in the window   -> watch dbd print the new count here"
-  echo "  ctrl-c to stop everything"
+  echo "  curl localhost:8080/bump   -> the number moves in the gui AND in top"
+  echo "  click stop in top          -> that peer's row goes grey, then vanishes"
+  echo "  ctrl-c here                -> stops everything"
   echo ""
-  ./bin/gui --join
+  ./bin/top
   ;;
 esac

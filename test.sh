@@ -50,8 +50,31 @@ check "count survived dbd restart" "$G" "gui selftest: mode=joined count=4"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 
 echo "5. the format is pinned, not the binary"
-grep -q "CNT_VERSION  1" counter.h && ok "segment carries magic + version" \
+grep -q "CNT_VERSION   2" counter.h && ok "segment carries magic + version" \
                                    || bad "segment carries magic + version"
+
+echo "6. the registry: the dashboard reads shm, not ps"
+rm -f counter.db   # section 4 left a persisted count; start this one clean
+./bin/dbd >/tmp/dbd3.log 2>&1 & DP=$!; sleep 0.4
+./bin/webd --join --port 8101 >/dev/null 2>&1 & W1=$!
+./bin/webd --join --port 8102 >/dev/null 2>&1 & W2=$!
+sleep 0.5
+T=$(./bin/top --selftest 2>&1)
+check "top sees dbd + 2 webd" "$T" "top selftest: peers=3 count=0"
+curl -s localhost:8101/bump >/dev/null
+T=$(./bin/top --selftest 2>&1)
+check "top sees the shared count" "$T" "top selftest: peers=3 count=1"
+
+echo "7. dead peers are reaped by the owner"
+kill $W2 2>/dev/null; wait $W2 2>/dev/null; sleep 0.6
+T=$(./bin/top --selftest 2>&1)
+check "peer table shrank after a kill" "$T" "top selftest: peers=2 count=1"
+kill $W1 2>/dev/null; wait $W1 2>/dev/null
+kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
+
+echo "8. the dashboard tolerates an absent owner"
+./bin/top --selftest >/dev/null 2>&1
+check "top --selftest exits 2 with no dbd" "$?" "2"
 
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"

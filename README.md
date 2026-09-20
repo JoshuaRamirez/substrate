@@ -17,16 +17,33 @@ no third-party code. Each is one translation unit.
 | `bin/dbd`  | the database. Owns the segment's creation, lifetime, persistence. |
 | `bin/webd` | an HTTP driver. ~110 lines of BSD sockets. |
 | `bin/gui`  | a native Cocoa window. Not a webview. No HTML. No toolkit to install. |
+| `bin/top`  | a native dashboard of every running peer. Docker Desktop, minus Docker. |
 
-They share one `u64` in one shared-memory page.
+They share one `u64` and a 16-slot peer table in one shared-memory page.
+
+## The dashboard
+
+`bin/top` does not run `ps`. It does not poll a daemon. It does not speak a
+protocol. Every process writes its own row into the shared peer table on
+join, and `top` reads all the rows every frame. Liveness is `kill(pid, 0)` —
+the OS answers, so there is no heartbeat to miss. `dbd` reaps rows whose
+process is gone, because `dbd` is the owner.
+
+Each row has a `stop` button, which is a `SIGTERM` to that pid.
+
+The registry needs no lock and no protocol for the same reason the count
+needs none, but by a different route: **ownership is partitioned.** Each
+process is the only writer of its own row. Claiming a free row is one
+compare-exchange. That is the entire concurrency story.
 
 ## Run it
 
 ```sh
 ./build.sh
 ./test.sh          # the falsification criteria
-./run.sh           # the demo
+./run.sh           # the demo: dbd + webd + gui + top
 ./run.sh alone     # the standalone half
+./run.sh top       # the dashboard by itself
 ```
 
 Then: `curl localhost:8080/bump` and watch the number change in the native
@@ -113,7 +130,8 @@ contention, crash recovery, cross-language ABI. All of those arrive with
 ## Sizes
 
 ```
-bin/dbd    33K
+bin/dbd    34K
 bin/webd   34K
 bin/gui    53K
+bin/top    54K
 ```

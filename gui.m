@@ -82,14 +82,15 @@ int main(int argc, const char **argv) {
     }
 
     if (selftest) {                    /* same data path, no window */
-        if (counter_open(&C, join) < 0) return 2;
+        if (counter_open(&C, join, "gui", "ui") < 0) return 2;
         uint64_t v = counter_bump(&C);
         printf("gui selftest: mode=%s count=%llu\n", counter_mode(&C),
                (unsigned long long)v);
+        counter_close(&C);
         return 0;
     }
 
-    if (counter_open(&C, join) < 0) return 2;   /* <- the only mode-aware line */
+    if (counter_open(&C, join, "gui", "ui") < 0) return 2;   /* <- the only mode-aware line */
 
     @autoreleasepool {
         [NSApplication sharedApplication];

@@ -32,16 +32,17 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--join")) join = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) {
-            if (counter_open(&C, join) < 0) return 2;
+            if (counter_open(&C, join, "webd", "http") < 0) return 2;
             uint64_t v = counter_bump(&C);
             printf("webd selftest: mode=%s count=%llu\n", counter_mode(&C),
                    (unsigned long long)v);
+            counter_close(&C);
             return 0;
         }
     }
     signal(SIGPIPE, SIG_IGN);
 
-    if (counter_open(&C, join) < 0) return 2;   /* <- the only mode-aware line */
+    if (counter_open(&C, join, "webd", "http") < 0) return 2;   /* <- the only mode-aware line */
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;
