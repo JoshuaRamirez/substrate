@@ -87,6 +87,22 @@ static int do_stop(void) {
         perror("dbd: kill");
         return 1;
     }
+    /* Note who else is on the page BEFORE the owner leaves and the table
+     * goes with it. These processes do not die -- they detach and keep
+     * running against private memory, which is the whole point of the design
+     * but a surprise if an uninstall does not say so out loud. */
+    struct { pid_t pid; char name[SUB_NAMELEN]; } others[SUB_MAX_PEERS];
+    int n_others = 0;
+    for (int i = 0; i < SUB_MAX_PEERS; i++) {
+        sub_peer *p = &s->peers[i];
+        if (!sub_peer_alive(p)) continue;
+        pid_t pp = (pid_t)atomic_load(&p->pid);
+        if (pp == who) continue;
+        others[n_others].pid = pp;
+        snprintf(others[n_others].name, sizeof others[n_others].name, "%s", p->name);
+        n_others++;
+    }
+
     printf("dbd: SIGTERM -> owner pid %d, waiting\n", (int)who);
     /* Let it leave on its own feet. Its own exit path is the only one that
      * persists the count and unlinks the name; killing it harder loses both. */
@@ -98,6 +114,12 @@ static int do_stop(void) {
     munmap(s, sizeof *s);
     if (live) { fprintf(stderr, "dbd: owner pid %d did not exit\n", (int)who); return 1; }
     printf("dbd: owner stopped\n");
+    if (n_others > 0) {
+        printf("dbd: %d peer(s) are still running, now detached "
+               "(each keeps counting in its own memory):\n", n_others);
+        for (int i = 0; i < n_others; i++)
+            printf("       pid %-7d %s\n", (int)others[i].pid, others[i].name);
+    }
     return 0;
 }
 
