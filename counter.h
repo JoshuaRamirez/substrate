@@ -13,6 +13,12 @@
  * The segment also carries a PEER TABLE: the registry the dashboard reads.
  * Each process owns exactly one slot and is its only writer, so the registry
  * needs no lock and no protocol either -- ownership is partitioned, not shared.
+ *
+ * It also carries the DATABASE PATH: where the owner persists the count. Any
+ * peer may retarget it by writing here; the owner notices on its next tick.
+ * This is the one shared value that is neither a single atomic nor a row with
+ * a sole writer, so it is the one value that needs a protocol -- a seqlock.
+ * The exception proves the rule the rest of this file is built on.
  */
 #ifndef COUNTER_H
 #define COUNTER_H
@@ -28,11 +34,13 @@
 #include <sys/mman.h>
 #include <errno.h>
 
-#define CNT_SHM_NAME  "/cnt.v2"      /* macOS caps shm names at 31 chars */
-#define CNT_MAGIC     0x434E5432u    /* "CNT2" */
-#define CNT_VERSION   2u             /* pin the FORMAT, not the binary */
+#define CNT_SHM_NAME  "/cnt.v4"      /* macOS caps shm names at 31 chars */
+#define CNT_MAGIC     0x434E5434u    /* "CNT4" */
+#define CNT_VERSION   4u             /* pin the FORMAT, not the binary */
 #define CNT_MAX_PEERS 16
 #define CNT_NAMELEN   16
+#define CNT_PATHLEN   256
+#define CNT_TOKLEN    33             /* 128 bits, hex, + NUL */
 
 /* One row of the dashboard. Written only by the process that claimed it. */
 typedef struct {
@@ -49,6 +57,9 @@ typedef struct {
     uint32_t          magic;
     uint32_t          version;
     _Atomic uint64_t  count;
+    _Atomic uint32_t  path_seq;            /* odd = a path write is in flight */
+    char              path[CNT_PATHLEN];   /* absolute; the owner's database */
+    char              admin[CNT_TOKLEN];   /* minted by the owner before `magic` */
     cnt_peer          peers[CNT_MAX_PEERS];
 } cnt_seg;
 
@@ -117,6 +128,111 @@ static inline int cnt_reap(cnt_seg *s) {
     return n;
 }
 
+
+
+/* ---- the admin credential ---- */
+
+/* The trust boundary of this system is the shm file mode, not a password.
+ * Anything that can map the segment can already write every value in it, so
+ * peers are inside by construction -- `top` never asks for a token.
+ *
+ * What is OUTSIDE is webd's callers: a browser tab can reach port 8080 but
+ * cannot map shm. So the owner mints a random token into the segment, and
+ * BEING ABLE TO READ IT is the credential. webd demands it from callers and
+ * reads it from the segment to check. No secret ever leaves the substrate
+ * except into the page webd serves, which the same-origin policy protects.
+ */
+
+static inline void cnt_mint_admin(cnt_seg *s) {
+    static const char HEX[] = "0123456789abcdef";
+    unsigned char raw[16];
+    FILE *f = fopen("/dev/urandom", "rb");
+    if (!f || fread(raw, 1, sizeof raw, f) != sizeof raw) {
+        /* Never fall back to something guessable: refuse instead. */
+        if (f) fclose(f);
+        s->admin[0] = 0;
+        return;
+    }
+    fclose(f);
+    for (int i = 0; i < 16; i++) {
+        s->admin[i * 2]     = HEX[raw[i] >> 4];
+        s->admin[i * 2 + 1] = HEX[raw[i] & 15];
+    }
+    s->admin[32] = 0;
+}
+
+/* Constant-time compare: a token check should not leak its prefix by timing. */
+static inline int cnt_admin_ok(cnt_seg *s, const char *presented) {
+    if (!s || !presented || !s->admin[0]) return 0;
+    size_t n = strlen(s->admin);
+    if (strlen(presented) != n) return 0;
+    unsigned char d = 0;
+    for (size_t i = 0; i < n; i++) d |= (unsigned char)(s->admin[i] ^ presented[i]);
+    return d == 0;
+}
+
+/* ---- the database path: the one value that needs a protocol ---- */
+
+/* Every other shared value here is a single atomic, or a row whose only writer
+ * is the process that claimed it. The path is neither: it is 256 bytes and any
+ * peer may write it. So it gets a seqlock -- the same "publish last" shape dbd
+ * uses for `magic`, generalised. Writers take the sequence odd, copy, put it
+ * back even. Readers copy, then check the sequence did not move under them. */
+
+static inline int cnt_path_read(cnt_seg *s, char *out, size_t cap) {
+    char tmp[CNT_PATHLEN];
+    for (int tries = 0; tries < 128; tries++) {
+        uint32_t a = atomic_load_explicit(&s->path_seq, memory_order_acquire);
+        if (a & 1) continue;                       /* a write is in flight */
+        memcpy(tmp, s->path, CNT_PATHLEN);
+        tmp[CNT_PATHLEN - 1] = 0;                  /* a torn copy is still bounded */
+        atomic_thread_fence(memory_order_acquire);
+        if (atomic_load_explicit(&s->path_seq, memory_order_relaxed) == a) {
+            snprintf(out, cap, "%s", tmp);
+            return 1;
+        }
+    }
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+/* Absolute paths only: peers have different working directories, so a relative
+ * path names a different file in each one. Returns 0, or -1 relative, -2 too
+ * long, -3 contended. */
+static inline int cnt_path_write(cnt_seg *s, const char *path) {
+    if (!path || path[0] != '/') return -1;
+    size_t n = strlen(path);
+    if (n >= CNT_PATHLEN) return -2;
+    for (int tries = 0; tries < 4096; tries++) {
+        uint32_t a = atomic_load_explicit(&s->path_seq, memory_order_relaxed);
+        if (a & 1) continue;
+        if (!atomic_compare_exchange_weak_explicit(&s->path_seq, &a, a + 1,
+                memory_order_acquire, memory_order_relaxed)) continue;
+        memset(s->path, 0, CNT_PATHLEN);
+        memcpy(s->path, path, n);
+        atomic_store_explicit(&s->path_seq, a + 2, memory_order_release);
+        return 0;
+    }
+    return -3;
+}
+
+static inline const char *cnt_path_error(int rc) {
+    switch (rc) {
+        case 0:  return "ok";
+        case -1: return "path must be absolute";
+        case -2: return "path too long";
+        default: return "path is being written by another peer";
+    }
+}
+
+/* Resolve against this process's cwd, so what lands in the segment is absolute. */
+static inline void cnt_abspath(const char *in, char *out, size_t cap) {
+    if (!in || !*in) { if (cap) out[0] = 0; return; }
+    if (in[0] == '/') { snprintf(out, cap, "%s", in); return; }
+    char cwd[1024];
+    if (getcwd(cwd, sizeof cwd)) snprintf(out, cap, "%s/%s", cwd, in);
+    else                         snprintf(out, cap, "%s", in);
+}
 
 /* Attach to the owner's segment without printing. Returns NULL on failure and
  * sets *err: 1 = no owner, 2 = bad magic, 3 = format mismatch. The dashboard

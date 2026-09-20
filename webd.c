@@ -8,6 +8,23 @@
  *   GET /api/bump   -> increment, return JSON
  *   GET /bump       -> increment, plain text (curl-friendly)
  *   GET /status     -> plain text
+ *   POST /admin/dbfile?path=...  -> move the database, live. ADMIN ONLY.
+ *
+ * The admin route is gated because webd's callers are the only things in this
+ * system OUTSIDE the trust boundary: a browser tab can reach port 8080 but
+ * cannot map the segment. Peers are inside by construction, so `top` moves the
+ * database with no token at all. Callers must present X-Admin-Token, which the
+ * owner minted into the segment and webd reads from there to compare.
+ *
+ * Three properties do the work, and all three are needed:
+ *   POST    -- a GET can be fired by <img src>; a POST cannot.
+ *   a custom header -- forces a CORS preflight that this server never answers,
+ *                      so a cross-origin page cannot even send the request.
+ *   an unguessable token -- read only from shm, or from the same-origin page.
+ *
+ * Moving the database is not an RPC to dbd. webd writes the path into the
+ * shared page and returns; dbd reads it on its next tick. There is no request,
+ * no reply, and no one to be down.
  *
  * It holds no state. Kill it and start a new one and nothing is lost, because
  * the state was never here -- it is in the owner's page.
@@ -17,6 +34,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
+#include <ctype.h>
 
 static counter C;
 
@@ -39,28 +57,106 @@ static const char PAGE[] =
 "td.nm{color:#e8e8e8}"
 ".dot{color:#34cc66}"
 "#ft{color:#484848;font-size:10px;margin-top:26px}"
+"#db{margin-top:30px;max-width:560px}"
+"#db label{display:block;color:#616161;font:400 10px ui-monospace,Menlo,monospace;"
+"padding-bottom:7px;border-bottom:1px solid #333;margin-bottom:11px}"
+"#p{background:#111;color:#ddd;border:1px solid #333;border-radius:6px;"
+"padding:8px 10px;font:12px ui-monospace,Menlo,monospace;width:398px}"
+"#mv{background:#2f2f2f;padding:9px 16px;font-size:12px;margin-left:7px}"
+"#mv:active{background:#252525}"
+"#msg{color:#666;font-size:10px;margin-top:9px;min-height:12px}"
 "</style>"
 "<h1>PIPELINE</h1><div id=sub></div>"
 "<div id=n>-</div><div id=lbl>count</div>"
 "<button onclick='bump()'>bump</button>"
 "<table><thead><tr><th></th><th>NAME</th><th>ROLE</th><th>PID</th>"
 "<th>OPS</th></tr></thead><tbody id=rows></tbody></table>"
+"<div id=db><label>DATABASE  (absolute path; the owner moves on its next tick)</label>"
+"<input id=p spellcheck=false><button id=mv onclick='move()'>move</button>"
+"<div id=msg></div></div>"
 "<div id=ft>this page polls /api. the native windows poll nothing -- "
 "they read the same page of memory.</div>"
 "<script>"
+"const TOK=%TOKEN%;"
 "async function tick(){"
 " try{const r=await fetch('/api',{cache:'no-store'});const d=await r.json();"
 "  document.getElementById('n').textContent=d.count;"
 "  document.getElementById('sub').textContent=d.shm+'  format v'+d.version+"
 "   '  mode '+d.mode;"
+"  const p=document.getElementById('p');"
+"  if(document.activeElement!==p) p.value=d.dbfile;"
 "  document.getElementById('rows').innerHTML=d.peers.map(p=>"
 "   '<tr><td class=dot>&bull;</td><td class=nm>'+p.name+'</td><td>'+p.role+"
 "   '</td><td>'+p.pid+'</td><td>'+p.ops+'</td></tr>').join('');"
 " }catch(e){document.getElementById('sub').textContent='webd unreachable';}"
 "}"
 "async function bump(){await fetch('/api/bump',{cache:'no-store'});tick();}"
+"async function move(){"
+" const v=document.getElementById('p').value.trim();const m=document.getElementById('msg');"
+" const r=await fetch('/admin/dbfile?path='+encodeURIComponent(v),"
+"  {method:'POST',cache:'no-store',headers:{'X-Admin-Token':TOK}});"
+" const d=await r.json();"
+" m.textContent=d.ok?'asked. dbd moves within 100ms.':('refused: '+d.detail);"
+" m.style.color=d.ok?'#34cc66':'#d46a6a';"
+" document.activeElement.blur();setTimeout(tick,200);"
+"}"
 "tick();setInterval(tick,300);"
 "</script>";
+
+
+/* Pull one header value out of a raw request. Case-insensitive name match. */
+static int header(const char *req, const char *name, char *out, size_t cap) {
+    size_t nl = strlen(name);
+    const char *p = strstr(req, "\r\n");
+    while (p) {
+        p += 2;
+        if (p[0] == '\r') break;                      /* end of headers */
+        if (!strncasecmp(p, name, nl) && p[nl] == ':') {
+            const char *v = p + nl + 1;
+            while (*v == ' ' || *v == '\t') v++;
+            size_t k = 0;
+            while (v[k] && v[k] != '\r' && k < cap - 1) k++;
+            memcpy(out, v, k); out[k] = 0;
+            return 1;
+        }
+        p = strstr(p, "\r\n");
+    }
+    if (cap) out[0] = 0;
+    return 0;
+}
+
+/* Paths arrive percent-encoded and leave inside JSON. Neither is interesting;
+ * both are necessary. */
+static void urldec(const char *in, char *out, size_t cap) {
+    size_t k = 0;
+    for (size_t i = 0; in[i] && k + 1 < cap; i++) {
+        if (in[i] == '%' && isxdigit((unsigned char)in[i+1])
+                         && isxdigit((unsigned char)in[i+2])) {
+            char h[3] = { in[i+1], in[i+2], 0 };
+            out[k++] = (char)strtol(h, NULL, 16);
+            i += 2;
+        } else if (in[i] == '+') out[k++] = ' ';
+        else out[k++] = in[i];
+    }
+    out[k] = 0;
+}
+
+static void jsonesc(const char *in, char *out, size_t cap) {
+    size_t k = 0;
+    for (size_t i = 0; in[i] && k + 2 < cap; i++) {
+        unsigned char c = (unsigned char)in[i];
+        if (c == '"' || c == '\\') { out[k++] = '\\'; out[k++] = (char)c; }
+        else if (c < 0x20)           { k += snprintf(out + k, cap - k, "\\u%04x", c); }
+        else                          out[k++] = (char)c;
+    }
+    out[k] = 0;
+}
+
+/* Where the owner is persisting, as this process sees it. */
+static void dbfile_now(char *out, size_t cap) {
+    if (!C.seg || !cnt_path_read(C.seg, out, cap) || !out[0])
+        snprintf(out, cap, "(none)");
+}
 
 static void reply(int fd, const char *status, const char *ctype, const char *body) {
     char hdr[256];
@@ -77,10 +173,14 @@ static void reply(int fd, const char *status, const char *ctype, const char *bod
 /* The peer table, rendered for the browser. Same rows `top` draws. */
 static void json_state(char *out, size_t cap) {
     size_t k = 0;
+    char db[CNT_PATHLEN], dbj[CNT_PATHLEN * 2];
+    dbfile_now(db, sizeof db);
+    jsonesc(db, dbj, sizeof dbj);
     k += snprintf(out + k, cap - k,
-        "{\"count\":%llu,\"mode\":\"%s\",\"shm\":\"%s\",\"version\":%u,\"peers\":[",
+        "{\"count\":%llu,\"mode\":\"%s\",\"shm\":\"%s\",\"version\":%u,"
+        "\"dbfile\":\"%s\",\"peers\":[",
         (unsigned long long)counter_read(&C), counter_mode(&C),
-        C.joined ? CNT_SHM_NAME : "(none)", CNT_VERSION);
+        C.joined ? CNT_SHM_NAME : "(none)", CNT_VERSION, dbj);
 
     int first = 1;
     if (C.seg) {
@@ -147,7 +247,16 @@ int main(int argc, char **argv) {
 
         char body[4096];
         if (!strcmp(path, "/")) {
-            reply(fd, "200 OK", "text/html; charset=utf-8", PAGE);
+            /* The token goes into the page. A cross-origin script may fetch "/"
+             * but the same-origin policy forbids it reading the response, so
+             * this hands the credential to your tab and to nobody else. */
+            static char page[sizeof PAGE + 64];
+            char tokj[CNT_TOKLEN + 8];
+            snprintf(tokj, sizeof tokj, "'%s'", (C.seg && C.seg->admin[0]) ? C.seg->admin : "");
+            const char *mark = strstr(PAGE, "%TOKEN%");
+            size_t pre = (size_t)(mark - PAGE);
+            snprintf(page, sizeof page, "%.*s%s%s", (int)pre, PAGE, tokj, mark + 7);
+            reply(fd, "200 OK", "text/html; charset=utf-8", page);
         } else if (!strcmp(path, "/api")) {
             json_state(body, sizeof body);
             reply(fd, "200 OK", "application/json", body);
@@ -160,10 +269,40 @@ int main(int argc, char **argv) {
             snprintf(body, sizeof body, "bumped\ncount = %llu\nmode  = %s\n",
                      (unsigned long long)v, counter_mode(&C));
             reply(fd, "200 OK", "text/plain; charset=utf-8", body);
+        } else if (!strncmp(path, "/admin/dbfile", 13)) {
+            /* Admin. Gated three ways: method, custom header, unguessable token. */
+            char tok[CNT_TOKLEN * 2] = {0};
+            header(buf, "X-Admin-Token", tok, sizeof tok);
+
+            if (strcmp(method, "POST") != 0) {
+                reply(fd, "405 Method Not Allowed", "application/json",
+                      "{\"ok\":false,\"detail\":\"POST only\"}");
+            } else if (!C.seg) {
+                reply(fd, "409 Conflict", "application/json",
+                      "{\"ok\":false,\"detail\":\"not joined -- this webd owns no segment\"}");
+            } else if (!cnt_admin_ok(C.seg, tok)) {
+                reply(fd, "401 Unauthorized", "application/json",
+                      "{\"ok\":false,\"detail\":\"X-Admin-Token missing or wrong\"}");
+            } else {
+                const char *q = strstr(path, "?path=");
+                char want[CNT_PATHLEN] = {0};
+                int rc = q ? (urldec(q + 6, want, sizeof want), cnt_path_write(C.seg, want))
+                           : -8;
+                const char *msg = rc == -8 ? "usage: POST /admin/dbfile?path=/absolute/path"
+                                           : cnt_path_error(rc);
+                char wj[CNT_PATHLEN * 2];
+                jsonesc(want, wj, sizeof wj);
+                snprintf(body, sizeof body,
+                         "{\"ok\":%s,\"requested\":\"%s\",\"detail\":\"%s\"}",
+                         rc == 0 ? "true" : "false", wj, msg);
+                reply(fd, rc == 0 ? "200 OK" : "400 Bad Request", "application/json", body);
+            }
         } else if (!strcmp(path, "/status")) {
             uint64_t v = counter_read(&C);                /* identical call site */
-            snprintf(body, sizeof body, "count = %llu\nmode  = %s\n",
-                     (unsigned long long)v, counter_mode(&C));
+            char db[CNT_PATHLEN];
+            dbfile_now(db, sizeof db);
+            snprintf(body, sizeof body, "count = %llu\nmode  = %s\ndb    = %s\n",
+                     (unsigned long long)v, counter_mode(&C), db);
             reply(fd, "200 OK", "text/plain; charset=utf-8", body);
         } else {
             reply(fd, "404 Not Found", "text/plain; charset=utf-8", "no\n");
