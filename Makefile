@@ -51,7 +51,7 @@ else
 endif
 
 # Built and shipped.
-PROGS  = bin/dbd bin/webd bin/look bin/layout bin/bench $(COCOA)
+PROGS  = bin/dbd bin/sub bin/webd bin/look bin/layout bin/bench $(COCOA)
 # Built, not shipped: fixtures that exist to be run by test.sh.
 FIXTURES = bin/mkdb bin/storm bin/wedge bin/hog bin/blobbench bin/peer
 
@@ -83,6 +83,7 @@ bin/db.o: db.blob | bin
 	ld -r -b binary -o $@ db.blob
 
 bin/dbd:       dbd.c       substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
+bin/sub:       sub.c       substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/layout:    layout.c    substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/bench:     bench.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/storm:     storm.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
@@ -134,10 +135,11 @@ distclean: clean
 # Installed under a "sub-" prefix, and not out of tidiness: this repo builds
 # programs called `top` and `look`, and both of those are real commands that
 # already live on the PATH. Installing them bare would shadow them.
-INSTALLED = sub-dbd sub-webd sub-look sub-layout sub-bench
+INSTALLED = sub sub-dbd sub-webd sub-look sub-layout sub-bench
 
 install: all
 	$(INSTALL) -d $(bindir) $(includedir)
+	$(INSTALL) -m 755 bin/sub    $(bindir)/sub
 	$(INSTALL) -m 755 bin/dbd    $(bindir)/sub-dbd
 	$(INSTALL) -m 755 bin/webd   $(bindir)/sub-webd
 	$(INSTALL) -m 755 bin/look   $(bindir)/sub-look
@@ -172,7 +174,7 @@ uninstall:
 	-@$(MAKE) --no-print-directory stop
 	-@if [ -x $(bindir)/sub-dbd ]; then $(bindir)/sub-dbd --unlink; \
 	  elif [ -x bin/dbd ]; then ./bin/dbd --unlink; fi
-	rm -f $(bindir)/sub-dbd $(bindir)/sub-webd $(bindir)/sub-look \
+	rm -f $(bindir)/sub $(bindir)/sub-dbd $(bindir)/sub-webd $(bindir)/sub-look \
 	      $(bindir)/sub-layout $(bindir)/sub-bench $(bindir)/sub-pypeer \
 	      $(bindir)/sub-gui $(bindir)/sub-top $(bindir)/sub-swiftpeer
 	rm -f $(includedir)/substrate.h

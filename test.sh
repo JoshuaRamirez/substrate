@@ -406,6 +406,66 @@ else
   check "another user cannot join"             "$(g OTHERUSER)" "1"
 fi
 
+# The peer table was written to show this project's own processes. Section 21
+# asks whether it is a process registry for anything else on the machine --
+# which is the same question, if the answer is "yes, given a wrapper".
+echo "21. the registry supervises processes that share no code with it"
+pkill -f 'bin/sub run' 2>/dev/null
+pkill -f 'bin/(dbd|webd)' 2>/dev/null; sleep 0.3
+
+./bin/sub ps >/dev/null 2>&1
+check "sub ps without a registry exits 1" "$?" "1"
+./bin/sub run -- true >/dev/null 2>&1
+check "sub run refuses rather than run unregistered" "$?" "3"
+./bin/sub run --anyway -- sh -c 'exit 7' >/dev/null 2>&1
+check "--anyway runs it, and passes the exit code back" "$?" "7"
+
+./bin/dbd >/dev/null 2>&1 & sleep 0.8
+./bin/sub run --name t1 -- sh -c 'exit 5' >/dev/null 2>&1
+check "sub run passes a child's exit code through" "$?" "5"
+
+# /bin/sh includes no header of ours and links nothing of ours.
+# In a subshell, so this shell does not job-control-report the wrapper we are
+# about to SIGKILL on purpose a few lines down.
+( ./bin/sub run --name svc --role shell -- sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 & )
+sleep 1
+check "a foreign process appears in the registry" \
+      "$(./bin/sub ps | awk '$2=="svc"{print $2}')" "svc"
+check "sub ps claims no row of its own" \
+      "$(./bin/sub ps | awk '/registered$/{print $1}')" "2"
+
+SPID=$(./bin/sub ps | awk '$2=="svc"{print $1}')
+WRAP=$(ps -o ppid= -p "$SPID" 2>/dev/null | tr -d ' ')
+check "the row holds the service's pid, not the wrapper's" \
+      "$(./bin/sub ps | awk -v w="$WRAP" '$1==w{print "found"}')" ""
+
+# The wrapper is a convenience. What is registered is the service, so the
+# registry must not care that the convenience died.
+kill -9 "$WRAP" 2>/dev/null; sleep 1
+check "killing the wrapper leaves the service registered" \
+      "$(./bin/sub ps | awk '$2=="svc"{print $2}')" "svc"
+
+./bin/sub stop svc >/dev/null 2>&1
+check "sub stop stops it" "$?" "0"
+sleep 0.5
+check "and the row goes with it" "$(./bin/sub ps | awk '$2=="svc"{print $2}')" ""
+
+./bin/sub stop dbd >/dev/null 2>&1
+check "sub stop refuses the registry's owner" "$?" "3"
+
+# Nobody releases a SIGKILLed process's row. The owner reaps it by asking the
+# OS, which is why this works for processes that never agreed to anything.
+./bin/sub run --name zomb -- sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 &
+sleep 1
+ZPID=$(./bin/sub ps | awk '$2=="zomb"{print $1}')
+kill -9 "$ZPID" 2>/dev/null; sleep 1
+check "a SIGKILLed service is reaped, unasked" \
+      "$(./bin/sub ps | awk '$2=="zomb"{print $2}')" ""
+
+./bin/dbd --stop >/dev/null 2>&1
+pkill -f 'bin/sub run' 2>/dev/null
+echo
+
 rm -f substrate.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail
