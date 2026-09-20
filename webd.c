@@ -9,6 +9,11 @@
  *   GET /bump       -> increment, plain text (curl-friendly)
  *   GET /status     -> plain text
  *   GET /reserve?n= -> reserve n ids, plain text. THE verb that waits.
+ *   GET /lookup?k=  -> the table linked into this binary. No owner needed.
+ *
+ * One process, two databases: a shared one it JOINS for writes, and a private
+ * read-only one it CARRIES. The second needs no owner at all -- it is already
+ * mapped, and every copy of this binary shares one physical image of it.
  *   POST /admin/dbfile?path=...  -> move the database, live. ADMIN ONLY.
  *
  * The admin route is gated because webd's callers are the only things in this
@@ -31,6 +36,7 @@
  * the state was never here -- it is in the owner's page.
  */
 #include "counter.h"
+#include "emdb.h"
 #include <stdlib.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -38,6 +44,7 @@
 #include <ctype.h>
 
 static counter C;
+static emdb    DB;      /* in-process, read-only, mapped from our own image */
 
 static const char PAGE[] =
 "<!doctype html><meta charset=utf-8><title>counter</title>"
@@ -224,6 +231,7 @@ int main(int argc, char **argv) {
     }
     signal(SIGPIPE, SIG_IGN);
 
+    emdb_open(&DB);                        /* no I/O: dyld already mapped it */
     if (counter_open(&C, join, "webd", "http") < 0) return 2;  /* only mode-aware line */
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
@@ -349,6 +357,18 @@ int main(int argc, char **argv) {
                          "reserve failed (ring full, or the owner went away)\nmode  = %s\n",
                          counter_mode(&C));
             reply(fd, base ? "200 OK" : "503 Service Unavailable",
+                  "text/plain; charset=utf-8", body);
+        } else if (!strncmp(path, "/lookup", 7)) {
+            const char *q = strstr(path, "?k=");
+            char k[EMDB_KEYLEN] = {0};
+            if (q) urldec(q + 3, k, sizeof k);
+            uint64_t v = 0;
+            int hit = k[0] && emdb_get(&DB, k, &v);
+            snprintf(body, sizeof body,
+                     "%s\nkey     = %s\nvalue   = %llu\nrecords = %zu\nsource  = this binary\n",
+                     hit ? "hit" : "miss", k[0] ? k : "(none)",
+                     (unsigned long long)v, DB.count);
+            reply(fd, hit ? "200 OK" : "404 Not Found",
                   "text/plain; charset=utf-8", body);
         } else if (!strcmp(path, "/status")) {
             uint64_t v = counter_read(&C);                /* identical call site */

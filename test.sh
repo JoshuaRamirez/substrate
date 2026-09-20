@@ -221,6 +221,32 @@ R=$(curl -s 'localhost:8144/reserve?n=1' | tail -1 | tr -d ' ')
 check "reserve falls back to local ids when detached" "$R" "mode=detached"
 kill $WB 2>/dev/null; wait $WB 2>/dev/null
 
+echo "16. the database that lives inside the executable"
+check "look answers with no owner, no files, no network" \
+      "$(cd /tmp && "$OLDPWD/bin/look" k000000042)" "111486301962"
+check "and the last record too" \
+      "$(cd /tmp && "$OLDPWD/bin/look" k000999999)" "2654433106564239"
+check "a miss is a miss" "$(./bin/look nosuchkey 2>&1)" "miss"
+check "it reports a million records" \
+      "$(./bin/look --stat | head -1 | tr -d ' ')" "records=1000000"
+
+rm -f counter.db
+./bin/webd --port 8145 >/dev/null 2>&1 & WC=$!; sleep 1.2
+check "webd carries the same table, alone" \
+      "$(curl -s 'localhost:8145/lookup?k=k000000042' | sed -n 3p | tr -d ' ')" "value=111486301962"
+check "and it needs no owner to answer" \
+      "$(curl -s 'localhost:8145/lookup?k=k000000042' | head -1)" "hit"
+kill $WC 2>/dev/null; wait $WC 2>/dev/null
+
+./bin/dbd >/tmp/dbdH.log 2>&1 & DH=$!; sleep 0.5
+./bin/webd --join --port 8146 >/dev/null 2>&1 & WD=$!; sleep 1.2
+check "one process, two databases: the private one" \
+      "$(curl -s 'localhost:8146/lookup?k=k000000007' | head -1)" "hit"
+check "one process, two databases: the shared one" \
+      "$(curl -s 'localhost:8146/reserve?n=2' | sed -n 2p | tr -d ' ')" "base=1"
+kill $WD 2>/dev/null; wait $WD 2>/dev/null
+kill -TERM $DH 2>/dev/null; wait $DH 2>/dev/null
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

@@ -18,14 +18,21 @@ else
   OUT="bin"
 fi
 
+# The embedded table. Generated, not committed: 40 MB of it.
+EMDB_N="${EMDB_N:-1000000}"
+clang -O2 -std=c11 mkdb.c -o bin/mkdb
+[ -f db.blob ] || ./bin/mkdb "$EMDB_N" db.blob
+EMBED="-Wl,-sectcreate,__TEXT,__emdb,db.blob"
+
 # shellcheck disable=SC2086
 clang $OPT $WARN $HARD -std=c11 dbd.c  -o $OUT/dbd
-clang $OPT $WARN $HARD -std=c11 webd.c -o $OUT/webd
+clang $OPT $WARN $HARD -std=c11 webd.c -o $OUT/webd $EMBED
 clang $OPT $WARN $HARD -std=c11 wedge.c -o $OUT/wedge
 clang $OPT $WARN $HARD -std=c11 bench.c -o $OUT/bench
 clang $OPT $WARN $HARD -std=c11 hog.c   -o $OUT/hog
+clang $OPT $WARN $HARD -std=c11 look.c  -o $OUT/look $EMBED
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa gui.m -o $OUT/gui
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa top.m -o $OUT/top
 
 echo "built${1:+ ($1)}:"
-ls -lh $OUT/dbd $OUT/webd $OUT/gui $OUT/top | awk '{printf "  %-10s %s\n", $9, $5}'
+ls -lh $OUT/dbd $OUT/webd $OUT/gui $OUT/top $OUT/look | awk '{printf "  %-10s %s\n", $9, $5}'
