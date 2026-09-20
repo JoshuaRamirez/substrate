@@ -485,6 +485,16 @@ static inline int counter_put(counter *c, uint64_t key, const void *data, uint64
     return 0;
 }
 
+/* Hand the owner a block the caller has already filled. This is the ingest
+ * path that avoids the second copy: a server can read a socket STRAIGHT INTO
+ * the arena and then publish, instead of landing it in a buffer first. */
+static inline int counter_publish(counter *c, uint64_t key, int block, uint64_t len) {
+    if (!c->seg || block < 0 || len == 0 || len > CNT_BLOCK_SIZE) return -1;
+    cnt_reply r = cnt_call(c->seg, CNT_OP_PUT, key, len, (uint64_t)block, CNT_CALL_TIMEOUT_NS);
+    if (r.err || r.full) { cnt_block_free(c->seg, block); return -3; }
+    return 0;
+}
+
 /* Locate a payload. Returns a pointer INTO THE SHARED PAGE -- zero copies.
  * The caller reads the bytes where they already are. */
 static inline const uint8_t *counter_get(counter *c, uint64_t key, uint64_t *len_out) {

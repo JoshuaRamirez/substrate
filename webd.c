@@ -10,6 +10,8 @@
  *   GET /status     -> plain text
  *   GET /reserve?n= -> reserve n ids, plain text. THE verb that waits.
  *   GET /lookup?k=  -> the table linked into this binary. No owner needed.
+ *   PUT /blob?k=N   -> store a payload in the shared arena
+ *   GET /blob?k=N   -> serve it straight out of the arena. Never copied here.
  *
  * One process, two databases: a shared one it JOINS for writes, and a private
  * read-only one it CARRIES. The second needs no owner at all -- it is already
@@ -370,6 +372,68 @@ int main(int argc, char **argv) {
                      (unsigned long long)v, DB.count);
             reply(fd, hit ? "200 OK" : "404 Not Found",
                   "text/plain; charset=utf-8", body);
+        } else if (!strncmp(path, "/blob", 5)) {
+            const char *q = strstr(path, "?k=");
+            uint64_t key = q ? strtoull(q + 3, NULL, 10) : 0;
+            if (!C.seg || !key) {
+                reply(fd, "400 Bad Request", "text/plain; charset=utf-8",
+                      "need ?k=N and a joined webd\n");
+            } else if (!strcmp(method, "PUT") || !strcmp(method, "POST")) {
+                /* Read the body STRAIGHT INTO an arena block. The bytes go
+                 * kernel -> shared page and are never copied again, by anyone.
+                 * Landing them in a local buffer first would double the cost
+                 * of the one path that still has to copy at all. */
+                char clh[32] = {0};
+                header(buf, "Content-Length", clh, sizeof clh);
+                unsigned long long want = strtoull(clh, NULL, 10);
+
+                const char *b = strstr(buf, "\r\n\r\n");
+                size_t got = b ? have - (size_t)((b + 4) - buf) : 0;
+
+                int rc;
+                if (!want || want > CNT_BLOCK_SIZE) {
+                    rc = -1;
+                } else {
+                    int blk = cnt_block_alloc(C.seg);
+                    if (blk < 0) { rc = -2; }            /* arena full: real backpressure */
+                    else {
+                        uint8_t *dst = cnt_block_ptr(C.seg, blk);
+                        if (got) memcpy(dst, b + 4, got > want ? (size_t)want : got);
+                        size_t off = got > want ? (size_t)want : got;
+                        while (off < want) {
+                            ssize_t r = read(fd, dst + off, (size_t)want - off);
+                            if (r <= 0) break;
+                            off += (size_t)r;
+                        }
+                        rc = (off == want) ? counter_publish(&C, key, blk, want) : -4;
+                        if (rc != 0 && off != want) cnt_block_free(C.seg, blk);
+                        got = off;
+                    }
+                }
+                snprintf(body, sizeof body,
+                         "{\"ok\":%s,\"key\":%llu,\"len\":%zu,\"blocks_free\":%d}",
+                         rc == 0 ? "true" : "false", (unsigned long long)key, got,
+                         cnt_blocks_free(C.seg));
+                reply(fd, rc == 0 ? "200 OK" : "507 Insufficient Storage",
+                      "application/json", body);
+            } else {
+                uint64_t len = 0;
+                const uint8_t *p = counter_get(&C, key, &len);
+                if (!p || !len) {
+                    reply(fd, "404 Not Found", "text/plain; charset=utf-8", "no such blob\n");
+                } else {
+                    /* Straight from the arena to the socket. webd never copies
+                     * it into a buffer of its own; the bytes go from the page
+                     * the owner put them in to the wire. */
+                    char hdr[256];
+                    int hn = snprintf(hdr, sizeof hdr,
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n"
+                        "Content-Length: %llu\r\nConnection: close\r\n\r\n",
+                        (unsigned long long)len);
+                    writeall(fd, hdr, (size_t)hn);
+                    writeall(fd, (const char *)p, (size_t)len);
+                }
+            }
         } else if (!strcmp(path, "/status")) {
             uint64_t v = counter_read(&C);                /* identical call site */
             char db[CNT_PATHLEN];

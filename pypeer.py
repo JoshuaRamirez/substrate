@@ -21,6 +21,7 @@ SLOT_SIZE, SLOT_N = 56, 32
 SLOT_STATE, SLOT_OP, SLOT_CLIENT, SLOT_ARG = 0, 4, 8, 16
 SLOT_RESULT, SLOT_LEN, SLOT_BLOCK, SLOT_ERR = 24, 32, 40, 48
 OP_RESERVE, OP_PUT, OP_GET = 0, 1, 2
+CLAIMED, SERVING = 4, 3
 FREE, REQUEST, DONE = 0, 1, 2
 PEER_SIZE, PEER_N = 64, 256
 PEER_STATE, PEER_PID, PEER_OPS, PEER_SINCE, PEER_NAME, PEER_ROLE = 0, 8, 16, 24, 32, 48
@@ -111,6 +112,41 @@ def release(s, i):
     s.cas32(OFF_PEERS + i * PEER_SIZE + PEER_STATE, 1, 0)
 
 
+def get_blob(s, key, timeout=2.0):
+    """Read a payload written by a C process, directly out of the arena.
+
+    Nothing is copied across a boundary: the ring returns a block index, and
+    this reads the bytes where they already live in the mapped page. An
+    interpreted language doing zero-copy IPC with a C program.
+    """
+    mine = None
+    for i in range(SLOT_N):
+        if s.cas32(OFF_RING + i * SLOT_SIZE + SLOT_STATE, FREE, CLAIMED):
+            mine = i
+            break
+    if mine is None:
+        return None
+    b = OFF_RING + mine * SLOT_SIZE
+    s.set64(b + SLOT_CLIENT, os.getpid())
+    s.set32(b + SLOT_OP, OP_GET)
+    s.set64(b + SLOT_ARG, key)
+    s.set32(b + SLOT_ERR, 0)
+    s.set32(b + SLOT_STATE, REQUEST)
+
+    end = time.monotonic() + timeout
+    out = None
+    while time.monotonic() < end:
+        if s.u32(b + SLOT_STATE) == DONE:
+            if not s.u32(b + SLOT_ERR):
+                blk, ln = s.u64(b + SLOT_RESULT), s.u64(b + SLOT_LEN)
+                addr = s.base + OFF_ARENA + blk * BLOCK_SIZE
+                out = ctypes.string_at(addr, ln)      # the only copy, and it is ours
+            break
+    s.set64(b + SLOT_CLIENT, 0)
+    s.set32(b + SLOT_STATE, FREE)
+    return out
+
+
 def bump(s, slot):
     v = s.add64(OFF_COUNT, 1)
     s.add64(OFF_PEERS + slot * PEER_SIZE + PEER_OPS, 1)
@@ -120,7 +156,7 @@ def bump(s, slot):
 def reserve(s, n, timeout=2.0):
     mine = None
     for i in range(SLOT_N):
-        if s.cas32(OFF_RING + i * SLOT_SIZE + SLOT_STATE, FREE, REQUEST):
+        if s.cas32(OFF_RING + i * SLOT_SIZE + SLOT_STATE, FREE, CLAIMED):
             mine = i
             break
     if mine is None:
@@ -156,6 +192,7 @@ def main():
     a = sys.argv
     nb = int(a[a.index("--bump") + 1]) if "--bump" in a else 1
     nr = int(a[a.index("--reserve") + 1]) if "--reserve" in a else 0
+    ng = int(a[a.index("--get") + 1]) if "--get" in a else 0
 
     last = 0
     for _ in range(nb):
@@ -165,6 +202,14 @@ def main():
         base = reserve(s, nr)
         print("pypeer: reserved %d, base=%d, last=%d"
               % (nr, base, 0 if base == 0 else base + nr - 1))
+    if ng:
+        blob = get_blob(s, ng)
+        if blob is None:
+            print("pypeer: blob %d not found" % ng)
+        else:
+            print("pypeer: blob %d is %d bytes, sha=%s"
+                  % (ng, len(blob),
+                     __import__("hashlib").sha256(blob).hexdigest()[:16]))
     print("pypeer: owner=%d slot=%d lang=python" % (s.u64(OFF_OWNER_PID), slot))
 
     release(s, slot)

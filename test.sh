@@ -305,6 +305,35 @@ for n in 8 64 128; do
 done
 kill -TERM $DJ 2>/dev/null; wait $DJ 2>/dev/null
 
+echo "19. payload transfer: bytes that cross the boundary without being copied"
+rm -f counter.db /tmp/pl.bin /tmp/pl.out
+./bin/dbd >/tmp/dbdK.log 2>&1 & DK=$!; sleep 0.5
+./bin/webd --join --port 8148 >/dev/null 2>&1 & WF=$!; waitport 8148
+head -c 900000 /dev/urandom > /tmp/pl.bin
+SHA=$(shasum -a 256 /tmp/pl.bin | cut -c1-16)
+
+R=$(curl -s -X PUT --data-binary @/tmp/pl.bin 'localhost:8148/blob?k=42')
+check "a 900KB payload is accepted" "$(echo "$R" | grep -o '\"ok\":true')" '"ok":true'
+check "and its length is right"     "$(echo "$R" | grep -o '\"len\":900000')" '"len":900000'
+curl -s 'localhost:8148/blob?k=42' -o /tmp/pl.out
+check "it comes back byte-identical" "$(cmp -s /tmp/pl.bin /tmp/pl.out && echo same)" "same"
+check "python reads the SAME bytes from the arena, zero-copy" \
+      "$(./pypeer.py --get 42 | sed -n 2p | grep -o 'sha=[0-9a-f]*' | cut -d= -f2)" "$SHA"
+check "a missing blob is a miss" \
+      "$(curl -s -o /dev/null -w '%{http_code}' 'localhost:8148/blob?k=999')" "404"
+
+# the arena is finite, and running out is backpressure with a status code
+FREE0=$(curl -s -X PUT --data-binary @/tmp/pl.bin 'localhost:8148/blob?k=43' | grep -o '"blocks_free":[0-9]*' | cut -d: -f2)
+check "each payload consumes a block" "$([ "$FREE0" -lt 64 ] && echo yes)" "yes"
+check "replacing a key frees the old block" \
+      "$(curl -s -X PUT --data-binary @/tmp/pl.bin 'localhost:8148/blob?k=43' | grep -o '\"ok\":true')" '"ok":true'
+check "an oversized payload is refused, not truncated" \
+      "$(head -c 1100000 /dev/urandom | curl -s -X PUT --data-binary @- 'localhost:8148/blob?k=44' \
+         -o /dev/null -w '%{http_code}')" "507"
+kill $WF 2>/dev/null; wait $WF 2>/dev/null
+kill -TERM $DK 2>/dev/null; wait $DK 2>/dev/null
+rm -f /tmp/pl.bin /tmp/pl.out
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

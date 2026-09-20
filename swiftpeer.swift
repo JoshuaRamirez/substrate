@@ -29,6 +29,7 @@ let SLOT_SIZE = 56, SLOT_N = 32
 let SLOT_STATE = 0, SLOT_OP = 4, SLOT_CLIENT = 8, SLOT_ARG = 16
 let SLOT_RESULT = 24, SLOT_LEN = 32, SLOT_BLOCK = 40, SLOT_ERR = 48
 let OP_RESERVE: Int32 = 0, OP_GET: Int32 = 2
+let SLOT_CLAIMED: UInt32 = 4
 let SLOT_FREE: UInt32 = 0, SLOT_REQUEST: UInt32 = 1, SLOT_DONE: UInt32 = 2
 
 let PEER_SIZE = 64, PEER_N = 256
@@ -124,7 +125,7 @@ func reserve(_ b: UnsafeMutableRawPointer, _ n: UInt64) -> UInt64 {
     var mine = -1
     for i in 0..<SLOT_N {
         let st = i32ptr(b, OFF_RING + i * SLOT_SIZE + SLOT_STATE)
-        if OSAtomicCompareAndSwap32Barrier(Int32(SLOT_FREE), Int32(SLOT_REQUEST), st) {
+        if OSAtomicCompareAndSwap32Barrier(Int32(SLOT_FREE), Int32(SLOT_CLAIMED), st) {
             mine = i; break
         }
     }

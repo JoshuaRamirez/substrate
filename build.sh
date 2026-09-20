@@ -34,6 +34,7 @@ clang $OPT $WARN $HARD -std=c11 wedge.c -o $OUT/wedge
 clang $OPT $WARN $HARD -std=c11 bench.c -o $OUT/bench
 clang $OPT $WARN $HARD -std=c11 hog.c   -o $OUT/hog
 clang $OPT $WARN $HARD -std=c11 storm.c -o $OUT/storm
+clang $OPT $WARN $HARD -std=c11 blobbench.c -o $OUT/blobbench
 clang $OPT $WARN $HARD -std=c11 look.c  -o $OUT/look $EMBED
 clang $OPT $WARN $HARD -std=c11 layout.c -o $OUT/layout
 
