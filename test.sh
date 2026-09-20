@@ -247,6 +247,35 @@ check "one process, two databases: the shared one" \
 kill $WD 2>/dev/null; wait $WD 2>/dev/null
 kill -TERM $DH 2>/dev/null; wait $DH 2>/dev/null
 
+echo "17. the format is the contract: three languages, one page"
+L=$(./bin/layout)
+val(){ echo "$L" | awk -v k="$1" '$1==k{print $2}'; }
+segsize=$(echo "$L" | awk '/^size/{print $2}')
+
+# The Swift and Python peers hardcode these. If C moves and they do not, they
+# would read garbage and call it agreement. Assert they still line up.
+check "swift knows the segment size"  "$(grep -o 'SEG_SIZE = [0-9]*' swiftpeer.swift | grep -o '[0-9]*')" "$segsize"
+check "python knows the segment size" "$(grep 'SEG_SIZE' pypeer.py | grep -o '[0-9]*$' | head -1)" "$segsize"
+check "swift knows OFF_COUNT"  "$(grep -o 'OFF_COUNT *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val count)"
+check "python knows OFF_COUNT" "$(grep -o 'OFF_COUNT, OFF_OWNER_PID, OFF_NEXT_ID = [0-9]*' pypeer.py | grep -o '[0-9]*$')" "$(val count)"
+check "swift knows OFF_RING"   "$(grep -o 'OFF_RING *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val ring)"
+check "swift knows OFF_PEERS"  "$(grep -o 'OFF_PEERS *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val peers)"
+check "swift knows the magic"  "$(grep -o '0x434E543[0-9]' swiftpeer.swift | head -1)" "0x434E5436"
+check "python knows the magic" "$(grep -o '0x434E543[0-9]' pypeer.py | head -1)" "0x434E5436"
+
+rm -f counter.db
+./bin/dbd >/tmp/dbdI.log 2>&1 & DI=$!; sleep 0.5
+./bin/webd --join --port 8147 >/dev/null 2>&1 & WE=$!; sleep 1.2
+curl -s localhost:8147/bump >/dev/null; curl -s localhost:8147/bump >/dev/null   # C: 2
+check "swift joins and agrees"  "$(./bin/swiftpeer --bump 3 | head -1)" "swiftpeer: bumped 3, count=5"
+check "python joins and agrees" "$(./pypeer.py --bump 4 | head -1)" "pypeer: bumped 4, count=9"
+check "C sees both of them"     "$(curl -s localhost:8147/status | head -1 | tr -d ' ')" "count=9"
+check "swift can use the ring"  "$(./bin/swiftpeer --bump 0 --reserve 5 | sed -n 2p)" "swiftpeer: reserved 5, base=1, last=5"
+check "python can use the ring" "$(./pypeer.py --bump 0 --reserve 5 | sed -n 2p)" "pypeer: reserved 5, base=6, last=10"
+check "C continues the same id space" "$(curl -s 'localhost:8147/reserve?n=2' | sed -n 2p | tr -d ' ')" "base=11"
+kill $WE 2>/dev/null; wait $WE 2>/dev/null
+kill -TERM $DI 2>/dev/null; wait $DI 2>/dev/null
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

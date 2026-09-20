@@ -31,8 +31,15 @@ clang $OPT $WARN $HARD -std=c11 wedge.c -o $OUT/wedge
 clang $OPT $WARN $HARD -std=c11 bench.c -o $OUT/bench
 clang $OPT $WARN $HARD -std=c11 hog.c   -o $OUT/hog
 clang $OPT $WARN $HARD -std=c11 look.c  -o $OUT/look $EMBED
+clang $OPT $WARN $HARD -std=c11 layout.c -o $OUT/layout
+
+# A second compiled toolchain, sharing nothing with the above but the format.
+if command -v swiftc >/dev/null 2>&1; then
+  swiftc -O swiftpeer.swift -o $OUT/swiftpeer 2>/dev/null || \
+    echo "  (swiftpeer skipped: swiftc failed)"
+fi
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa gui.m -o $OUT/gui
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa top.m -o $OUT/top
 
 echo "built${1:+ ($1)}:"
-ls -lh $OUT/dbd $OUT/webd $OUT/gui $OUT/top $OUT/look | awk '{printf "  %-10s %s\n", $9, $5}'
+ls -lh $OUT/dbd $OUT/webd $OUT/gui $OUT/top $OUT/look $OUT/swiftpeer 2>/dev/null | awk '{printf "  %-10s %s\n", $9, $5}'
