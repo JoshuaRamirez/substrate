@@ -120,6 +120,7 @@ int main(int argc, char **argv) {
     cnt_path_write(g_seg, DBFILE);       /* publish where the data actually goes */
     atomic_store(&g_seg->owner_pid, (uint64_t)getpid());
     atomic_store(&g_seg->path_writer, 0);
+    atomic_store(&g_seg->next_id, 1);   /* id 0 means "failed" */
     cnt_mint_admin(g_seg);        /* before magic: no peer sees a tokenless segment */
     g_seg->version = CNT_VERSION;
     g_seg->magic   = CNT_MAGIC;   /* magic last: peers see a valid segment or none */
@@ -134,12 +135,28 @@ int main(int argc, char **argv) {
            g_seg->admin[0] ? "ok" : "FAILED -- admin routes disabled");
     fflush(stdout);
 
+    /* The ring changes what this process IS. Before the reserve verb, dbd was
+     * a housekeeper that woke ten times a second. A verb whose answer a caller
+     * blocks on turns it into a server: it must spin. Housekeeping moves onto
+     * a slower cadence underneath. That cost is the honest price of a reply. */
     uint64_t last = (uint64_t)-1;
+    int tick = 0;
+    long idle = 0;
     while (!g_stop) {
+        /* Spin hot, then park. A ring's latency is its owner's polling
+         * interval, nothing else: sleeping 500us between polls made a
+         * 3-nanosecond memory handoff cost 620 MICROseconds -- worse than the
+         * TCP round trip it was supposed to beat. So stay hot while work is
+         * arriving, and only back off once the ring has been quiet a while. */
+        if (cnt_serve_ring(g_seg)) { idle = 0; continue; }
+        if (idle < 200000) { idle++; continue; }       /* ~1ms of hot spinning */
+        if (++tick < 100) { usleep(1000); continue; }  /* then park, 100ms cycle */
+        tick = 0;
         if (cnt_seqlock_repair(g_seg)) {
             printf("dbd: repaired a path seqlock left odd by a dead writer\n");
             fflush(stdout);
         }
+        cnt_reap_ring(g_seg);
         int reaped = cnt_reap(g_seg);
         if (reaped) { printf("dbd: reaped %d dead peer(s)\n", reaped); fflush(stdout); }
 
@@ -154,7 +171,6 @@ int main(int argc, char **argv) {
             persist(now);
             last = now;
         }
-        usleep(100000);
     }
 
     uint64_t final = atomic_load(&g_seg->count);

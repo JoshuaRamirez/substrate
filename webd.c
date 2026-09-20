@@ -8,6 +8,7 @@
  *   GET /api/bump   -> increment, return JSON
  *   GET /bump       -> increment, plain text (curl-friendly)
  *   GET /status     -> plain text
+ *   GET /reserve?n= -> reserve n ids, plain text. THE verb that waits.
  *   POST /admin/dbfile?path=...  -> move the database, live. ADMIN ONLY.
  *
  * The admin route is gated because webd's callers are the only things in this
@@ -331,6 +332,24 @@ int main(int argc, char **argv) {
                          rc == 0 ? "true" : "false", wj, msg);
                 reply(fd, rc == 0 ? "200 OK" : "400 Bad Request", "application/json", body);
             }
+        } else if (!strncmp(path, "/reserve", 8)) {
+            /* The one call in this program that waits for an answer. Alone it
+             * is an add; joined it is a ring round trip. Same call site. */
+            const char *q = strstr(path, "?n=");
+            uint64_t n = q ? strtoull(q + 3, NULL, 10) : 1;
+            if (n == 0 || n > 1000000) n = 1;
+            uint64_t base = counter_reserve(&C, n);        /* identical call site */
+            if (base)
+                snprintf(body, sizeof body,
+                         "reserved %llu ids\nbase  = %llu\nlast  = %llu\nmode  = %s\n",
+                         (unsigned long long)n, (unsigned long long)base,
+                         (unsigned long long)(base + n - 1), counter_mode(&C));
+            else
+                snprintf(body, sizeof body,
+                         "reserve failed (ring full, or the owner went away)\nmode  = %s\n",
+                         counter_mode(&C));
+            reply(fd, base ? "200 OK" : "503 Service Unavailable",
+                  "text/plain; charset=utf-8", body);
         } else if (!strcmp(path, "/status")) {
             uint64_t v = counter_read(&C);                /* identical call site */
             char db[CNT_PATHLEN];

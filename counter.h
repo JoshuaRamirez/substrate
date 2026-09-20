@@ -35,12 +35,13 @@
 #include <sys/stat.h>
 #include <errno.h>
 
-#define CNT_SHM_NAME  "/cnt.v5"      /* macOS caps shm names at 31 chars */
-#define CNT_MAGIC     0x434E5435u    /* "CNT5" */
-#define CNT_VERSION   5u             /* pin the FORMAT, not the binary */
+#define CNT_SHM_NAME  "/cnt.v6"      /* macOS caps shm names at 31 chars */
+#define CNT_MAGIC     0x434E5436u    /* "CNT6" */
+#define CNT_VERSION   6u             /* pin the FORMAT, not the binary */
 #define CNT_MAX_PEERS 16
 #define CNT_NAMELEN   16
 #define CNT_PATHLEN   256
+#define CNT_RING_SLOTS 32
 #define CNT_TOKLEN    33             /* 128 bits, hex, + NUL */
 
 /* One row of the dashboard. Written only by the process that claimed it. */
@@ -53,6 +54,32 @@ typedef struct {
     char             role[CNT_NAMELEN];
 } cnt_peer;
 
+/* ---- the ring: one slot per in-flight request ----
+ *
+ * Everything else in this segment is fire-and-forget or shared-read, and needs
+ * no protocol. A verb whose RESULT the caller must wait for is the first thing
+ * that does. This is that protocol, and it is the smallest one that works:
+ * a slot the client owns for the duration of one call.
+ *
+ *   free --(client CAS)--> request --(owner)--> done --(client)--> free
+ *
+ * No lock. The slot has exactly one writer at every point in its cycle: the
+ * client owns it in `free` and `done`, the owner owns it in `request`. The
+ * state word is the handoff, and it is a single atomic. Ownership is
+ * partitioned in TIME rather than in space -- the same trick as the peer
+ * table, turned sideways. */
+typedef struct {
+    _Atomic uint32_t state;      /* CNT_SLOT_* below */
+    _Atomic uint64_t client;     /* pid, so the owner can free a dead caller's slot */
+    _Atomic uint64_t arg;        /* how many ids to reserve */
+    _Atomic uint64_t result;     /* the base of the reserved range */
+    _Atomic uint32_t err;        /* 0 ok, 1 refused */
+} cnt_slot;
+
+#define CNT_SLOT_FREE    0u
+#define CNT_SLOT_REQUEST 1u
+#define CNT_SLOT_DONE    2u
+
 /* The entire shared "database". */
 typedef struct {
     uint32_t          magic;
@@ -63,6 +90,8 @@ typedef struct {
     _Atomic uint64_t  path_writer;         /* pid holding path_seq odd, else 0 */
     char              path[CNT_PATHLEN];   /* absolute; the owner's database */
     char              admin[CNT_TOKLEN];   /* minted by the owner before `magic` */
+    _Atomic uint64_t  next_id;             /* the id space the ring hands out */
+    cnt_slot          ring[CNT_RING_SLOTS];
     cnt_peer          peers[CNT_MAX_PEERS];
 } cnt_seg;
 
@@ -71,6 +100,7 @@ typedef struct {
     _Atomic uint64_t *ops;       /* <- and here. same trick, same pattern. */
     _Atomic uint64_t  own;       /* backing store when alone */
     _Atomic uint64_t  own_ops;
+    _Atomic uint64_t  own_next;  /* the id space, when alone */
     cnt_seg          *seg;       /* non-NULL only when joined AND attached */
     cnt_peer         *slot;      /* this process's row, when attached */
     int               joined;    /* was --join asked for? */
@@ -189,6 +219,118 @@ static inline int counter_revalidate(counter *c) {
     c->ops      = &slot->ops;
     c->detached = 0;
     return 1;
+}
+
+
+/* ---- reserve: the verb whose answer the caller waits for ----
+ *
+ * THE TEST. Every other call here is a store the caller walks away from.
+ * This one needs a value back, computed by the owner, and that is the case
+ * the whole "joining is a flag" claim had never faced.
+ *
+ * The call site is the same in both modes -- but be exact about what that
+ * costs. Alone, this is an add. Joined, it is a round trip: a slot claim, a
+ * publish, a spin, a read. Same signature, same result, ~three orders of
+ * magnitude apart. The abstraction holds; the performance does not pretend to.
+ */
+
+#define CNT_RESERVE_TIMEOUT_NS 2000000000ll   /* 2 seconds, measured on a clock */
+
+static inline int64_t cnt_now_ns(void) {
+    struct timespec t;
+    clock_gettime(CLOCK_MONOTONIC, &t);
+    return (int64_t)t.tv_sec * 1000000000ll + t.tv_nsec;
+}
+
+/* Returns the base of a reserved range of `n` ids, or 0 on failure. */
+static inline uint64_t counter_reserve(counter *c, uint64_t n) {
+    if (n == 0) return 0;
+
+    if (!c->seg) {                        /* alone (or detached): we are the owner */
+        return atomic_fetch_add_explicit(&c->own_next, n, memory_order_relaxed);
+    }
+
+    cnt_seg *s = c->seg;
+    cnt_slot *mine = NULL;
+    for (int i = 0; i < CNT_RING_SLOTS && !mine; i++) {
+        uint32_t expect = CNT_SLOT_FREE;
+        if (atomic_compare_exchange_strong(&s->ring[i].state, &expect, CNT_SLOT_REQUEST))
+            mine = &s->ring[i];           /* claimed: the slot is ours until DONE */
+    }
+    if (!mine) return 0;                  /* ring full: every slot in flight */
+
+    atomic_store(&mine->client, (uint64_t)getpid());
+    atomic_store(&mine->arg, n);
+    atomic_store(&mine->err, 0);
+    atomic_store_explicit(&mine->state, CNT_SLOT_REQUEST, memory_order_release);
+
+    uint64_t base = 0;
+    int64_t deadline = cnt_now_ns() + CNT_RESERVE_TIMEOUT_NS;
+    for (long spin = 0; ; spin++) {
+        if (atomic_load_explicit(&mine->state, memory_order_acquire) == CNT_SLOT_DONE) {
+            base = atomic_load(&mine->err) ? 0 : atomic_load(&mine->result);
+            atomic_store(&mine->client, 0);
+            atomic_store_explicit(&mine->state, CNT_SLOT_FREE, memory_order_release);
+            return base;
+        }
+        /* An owner that died mid-request must not hang us forever -- and the
+         * cutoff is wall time, not a spin count, because a spin count silently
+         * means "4ms" on a fast machine and "40ms" on a slow one. */
+        if ((spin & 0x3FFF) == 0x3FFF) {
+            if (!cnt_owner_alive(s)) break;
+            if (cnt_now_ns() > deadline) break;
+        }
+    }
+    atomic_store(&mine->client, 0);       /* give the slot back; we gave up */
+    atomic_store_explicit(&mine->state, CNT_SLOT_FREE, memory_order_release);
+    return 0;
+}
+
+/* The owner side. Serves every pending slot; returns how many it served.
+ * Call it in a tight loop -- which is the real cost of this verb: the owner
+ * stops being a housekeeper on a 100ms tick and becomes a server. */
+static inline int cnt_serve_ring(cnt_seg *s) {
+    int served = 0;
+    for (int i = 0; i < CNT_RING_SLOTS; i++) {
+        cnt_slot *q = &s->ring[i];
+        if (atomic_load_explicit(&q->state, memory_order_acquire) != CNT_SLOT_REQUEST)
+            continue;
+
+        pid_t who = (pid_t)atomic_load(&q->client);
+        if (who > 0 && kill(who, 0) != 0) {        /* caller died mid-call */
+            atomic_store(&q->client, 0);
+            atomic_store_explicit(&q->state, CNT_SLOT_FREE, memory_order_release);
+            continue;
+        }
+        uint64_t n = atomic_load(&q->arg);
+        if (n == 0 || n > (1ull << 32)) {
+            atomic_store(&q->err, 1);
+            atomic_store(&q->result, 0);
+        } else {
+            atomic_store(&q->err, 0);
+            atomic_store(&q->result,
+                atomic_fetch_add_explicit(&s->next_id, n, memory_order_relaxed));
+        }
+        atomic_store_explicit(&q->state, CNT_SLOT_DONE, memory_order_release);
+        served++;
+    }
+    return served;
+}
+
+/* Free slots whose caller is gone, so a crashed client cannot leak the ring. */
+static inline int cnt_reap_ring(cnt_seg *s) {
+    int n = 0;
+    for (int i = 0; i < CNT_RING_SLOTS; i++) {
+        cnt_slot *q = &s->ring[i];
+        uint32_t st = atomic_load(&q->state);
+        if (st == CNT_SLOT_FREE) continue;
+        pid_t who = (pid_t)atomic_load(&q->client);
+        if (who > 0 && kill(who, 0) == 0) continue;
+        atomic_store(&q->client, 0);
+        atomic_store_explicit(&q->state, CNT_SLOT_FREE, memory_order_release);
+        n++;
+    }
+    return n;
 }
 
 /* ---- the admin credential ---- */
@@ -335,6 +477,7 @@ static inline void counter_open_alone(counter *c) {
     memset(c, 0, sizeof *c);
     atomic_store(&c->own, 0);
     atomic_store(&c->own_ops, 0);
+    atomic_store(&c->own_next, 1);   /* id 0 means "failed" in both modes */
     c->cell   = &c->own;
     c->ops    = &c->own_ops;
     c->joined = 0;

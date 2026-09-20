@@ -22,6 +22,8 @@ fi
 clang $OPT $WARN $HARD -std=c11 dbd.c  -o $OUT/dbd
 clang $OPT $WARN $HARD -std=c11 webd.c -o $OUT/webd
 clang $OPT $WARN $HARD -std=c11 wedge.c -o $OUT/wedge
+clang $OPT $WARN $HARD -std=c11 bench.c -o $OUT/bench
+clang $OPT $WARN $HARD -std=c11 hog.c   -o $OUT/hog
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa gui.m -o $OUT/gui
 clang $OPT -Wall -Wextra -Wshadow $HARD -fobjc-arc -framework Cocoa top.m -o $OUT/top
 

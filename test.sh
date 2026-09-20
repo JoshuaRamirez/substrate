@@ -180,6 +180,47 @@ check "no temp file is left behind" "$(ls counter.db.tmp 2>/dev/null)" ""
 check "the count is there in full" "$(cat counter.db)" "1"
 kill -TERM $DE 2>/dev/null; wait $DE 2>/dev/null
 
+echo "14. reserve: the verb whose answer the caller waits for"
+rm -f counter.db
+./bin/webd --port 8140 >/dev/null 2>&1 & WA=$!; sleep 0.4
+check "alone: first range starts at 1" \
+      "$(curl -s 'localhost:8140/reserve?n=10' | sed -n 2p | tr -d ' ')" "base=1"
+check "alone: the next range follows it" \
+      "$(curl -s 'localhost:8140/reserve?n=5' | sed -n 2p | tr -d ' ')" "base=11"
+check "alone: mode is still alone" \
+      "$(curl -s 'localhost:8140/reserve?n=1' | sed -n 4p | tr -d ' ')" "mode=alone"
+kill $WA 2>/dev/null; wait $WA 2>/dev/null
+
+./bin/dbd >/tmp/dbdF.log 2>&1 & DF=$!; sleep 0.5
+./bin/webd --join --port 8141 >/dev/null 2>&1 & W7=$!
+./bin/webd --join --port 8142 >/dev/null 2>&1 & W8=$!; sleep 0.6
+check "joined: same call site, same answers" \
+      "$(curl -s 'localhost:8141/reserve?n=10' | sed -n 2p | tr -d ' ')" "base=1"
+check "joined: mode is joined" \
+      "$(curl -s 'localhost:8141/reserve?n=1' | sed -n 4p | tr -d ' ')" "mode=joined"
+check "two separate processes share one id space" \
+      "$(curl -s 'localhost:8142/reserve?n=4' | sed -n 2p | tr -d ' ')" "base=12"
+check "and the range is contiguous" \
+      "$(curl -s 'localhost:8142/reserve?n=4' | sed -n 3p | tr -d ' ')" "last=19"
+kill $W7 $W8 2>/dev/null; wait $W7 2>/dev/null; wait $W8 2>/dev/null
+kill -TERM $DF 2>/dev/null; wait $DF 2>/dev/null
+
+echo "15. the ring survives its callers"
+rm -f counter.db
+./bin/dbd >/tmp/dbdG.log 2>&1 & DG=$!; sleep 0.5
+./bin/hog >/dev/null 2>&1                            # claims every slot, then dies
+sleep 0.6
+./bin/webd --join --port 8143 >/dev/null 2>&1 & W9=$!; sleep 0.5
+check "a dead caller's slots are reclaimed" \
+      "$(curl -s 'localhost:8143/reserve?n=1' | head -1)" "reserved 1 ids"
+kill $W9 2>/dev/null; wait $W9 2>/dev/null
+
+./bin/webd --join --port 8144 >/dev/null 2>&1 & WB=$!; sleep 0.5
+kill -TERM $DG 2>/dev/null; wait $DG 2>/dev/null; sleep 0.5
+R=$(curl -s 'localhost:8144/reserve?n=1' | tail -1 | tr -d ' ')
+check "reserve falls back to local ids when detached" "$R" "mode=detached"
+kill $WB 2>/dev/null; wait $WB 2>/dev/null
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail
