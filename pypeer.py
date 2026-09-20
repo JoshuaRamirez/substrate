@@ -6,8 +6,8 @@ survives leaving compilation behind entirely: an interpreted process, started
 from source, sharing a page and a protocol with C and Swift binaries.
 
 It shares no header, no library and no build step with them. It knows the same
-numbers ./bin/layout prints, and it reaches libc's shm_open, mmap and the
-OSAtomic primitives through ctypes. The real atomics matter: without them this
+numbers ./bin/layout prints, and it reaches shm_open, mmap and real
+atomics through ctypes. The real atomics matter: without them this
 would be a process that *looks* joined and silently corrupts the ring.
 """
 import ctypes, os, sys, time
@@ -37,12 +37,53 @@ libc.mmap.restype = ctypes.c_void_p
 libc.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
 
 # Real atomics, not Python's GIL. These are the same instructions the C and
-# Swift peers issue, reached from an interpreter through libSystem.
-libc.OSAtomicAdd64Barrier.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
-libc.OSAtomicAdd64Barrier.restype = ctypes.c_int64
-libc.OSAtomicCompareAndSwap32Barrier.argtypes = [ctypes.c_int32, ctypes.c_int32,
-                                                 ctypes.POINTER(ctypes.c_int32)]
-libc.OSAtomicCompareAndSwap32Barrier.restype = ctypes.c_bool
+# Swift peers issue, reached from an interpreter.
+#
+# Which library holds them is the one thing that is NOT portable here. Apple's
+# libSystem exports the OSAtomic family; glibc exports nothing of the kind, so
+# on Linux we go to libatomic, which carries the compiler's own __atomic_*
+# builtins as real functions. Two names for one instruction.
+#
+# The two differ in what they hand back, which is a quiet way to be wrong:
+# OSAtomicAdd64Barrier returns the NEW value, __atomic_fetch_add_8 returns the
+# OLD one. add64() below normalises to NEW.
+_SEQ_CST = 5
+
+if sys.platform == "darwin":
+    libc.OSAtomicAdd64Barrier.argtypes = [ctypes.c_int64, ctypes.POINTER(ctypes.c_int64)]
+    libc.OSAtomicAdd64Barrier.restype = ctypes.c_int64
+    libc.OSAtomicCompareAndSwap32Barrier.argtypes = [ctypes.c_int32, ctypes.c_int32,
+                                                     ctypes.POINTER(ctypes.c_int32)]
+    libc.OSAtomicCompareAndSwap32Barrier.restype = ctypes.c_bool
+
+    def _add64(ptr, n):
+        return libc.OSAtomicAdd64Barrier(n, ptr)
+
+    def _cas32(ptr, old, new):
+        return bool(libc.OSAtomicCompareAndSwap32Barrier(old, new, ptr))
+else:
+    try:
+        _at = ctypes.CDLL("libatomic.so.1")
+    except OSError:
+        sys.exit("pypeer: need libatomic.so.1 for real atomics "
+                 "(apt install libatomic1); refusing to fake them")
+    _at.__atomic_fetch_add_8.argtypes = [ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int]
+    _at.__atomic_fetch_add_8.restype = ctypes.c_uint64
+    _at.__atomic_compare_exchange_4.argtypes = [ctypes.c_void_p, ctypes.c_void_p,
+                                                ctypes.c_uint32, ctypes.c_int,
+                                                ctypes.c_int, ctypes.c_int]
+    _at.__atomic_compare_exchange_4.restype = ctypes.c_bool
+
+    def _add64(ptr, n):
+        prev = _at.__atomic_fetch_add_8(ctypes.cast(ptr, ctypes.c_void_p),
+                                        ctypes.c_uint64(n), _SEQ_CST)
+        return (prev + n) & 0xFFFFFFFFFFFFFFFF
+
+    def _cas32(ptr, old, new):
+        exp = ctypes.c_uint32(old)
+        return bool(_at.__atomic_compare_exchange_4(
+            ctypes.cast(ptr, ctypes.c_void_p), ctypes.byref(exp),
+            ctypes.c_uint32(new), False, _SEQ_CST, _SEQ_CST))
 
 
 class Seg:
@@ -69,10 +110,10 @@ class Seg:
 
     def add64(self, off, n):
         """Returns the NEW value, like Swift's OSAtomic -- not C's fetch_add."""
-        return libc.OSAtomicAdd64Barrier(n, self._i64(off))
+        return _add64(self._i64(off), n)
 
     def cas32(self, off, old, new):
-        return bool(libc.OSAtomicCompareAndSwap32Barrier(old, new, self._i32(off)))
+        return _cas32(self._i32(off), old, new)
 
     def putstr(self, off, s, n):
         raw = s.encode()[: n - 1].ljust(n, b"\0")

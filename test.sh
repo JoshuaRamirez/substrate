@@ -6,6 +6,7 @@ fail=0
 ok()   { printf "  PASS  %s\n" "$1"; }
 bad()  { printf "  FAIL  %s\n" "$1"; fail=1; }
 check(){ [ "$2" = "$3" ] && ok "$1" || bad "$1 (want '$3', got '$2')"; }
+skip() { printf "  SKIP  %s\n" "$1"; }
 
 # webd is 38MB (it carries the embedded table), so its FIRST launch after a
 # build reads it cold off disk. Wait for the port rather than guessing a sleep.
@@ -17,6 +18,18 @@ waitport(){
   return 1
 }
 
+
+# gui and top are Cocoa, so they only exist on macOS. What this suite asks of
+# them -- join, bump, read the registry, read the token -- is UI-free, so
+# elsewhere the identical checks run against bin/peer, which prints the same
+# lines. Same contract, same assertions, one less window.
+if [ -x ./bin/gui ]; then GUI="./bin/gui"; else GUI="./bin/peer"; fi
+if [ -x ./bin/top ]; then
+  TOPSELF="./bin/top --selftest"; TOPTOK="./bin/top --token"
+else
+  TOPSELF="./bin/peer --toptest"; TOPTOK="./bin/peer --token"
+fi
+[ -x ./bin/gui ] || echo "  (no Cocoa here: gui/top checks run against bin/peer)"
 
 pkill -f 'bin/(dbd|webd)' 2>/dev/null
 rm -f substrate.db; sleep 0.3
@@ -31,11 +44,11 @@ M=$(curl -s localhost:$PORT/status | sed -n 2p | tr -d ' ')
 check "webd alone reports mode" "$M" "mode=alone"
 kill $WP 2>/dev/null; wait $WP 2>/dev/null
 
-G=$(./bin/gui --selftest 2>&1)
+G=$($GUI --selftest 2>&1)
 check "gui alone counts" "$G" "gui selftest: mode=alone count=1"
 
 echo "2. joining without an owner is refused, not silently faked"
-./bin/gui --selftest --join >/dev/null 2>&1
+$GUI --selftest --join >/dev/null 2>&1
 check "gui --join exits 2 with no dbd" "$?" "2"
 
 echo "3. the pipeline: one cell, three processes"
@@ -43,7 +56,7 @@ echo "3. the pipeline: one cell, three processes"
 ./bin/webd --join --port $PORT >/dev/null 2>&1 & WP=$!; waitport $PORT
 curl -s localhost:$PORT/bump >/dev/null      # webd writes  -> 1
 curl -s localhost:$PORT/bump >/dev/null      # webd writes  -> 2
-G=$(./bin/gui --selftest --join 2>&1)        # gui writes   -> 3
+G=$($GUI --selftest --join 2>&1)        # gui writes   -> 3
 check "gui sees webd's writes" "$G" "gui selftest: mode=joined count=3"
 R=$(curl -s localhost:$PORT/status | head -1 | tr -d ' ')
 check "webd sees gui's write" "$R" "count=3"
@@ -56,7 +69,7 @@ echo "4. the owner persists state across its own restart"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 kill $WP 2>/dev/null; wait $WP 2>/dev/null; sleep 0.3
 ./bin/dbd >/tmp/dbd2.log 2>&1 & DP=$!; sleep 0.4
-G=$(./bin/gui --selftest --join 2>&1)
+G=$($GUI --selftest --join 2>&1)
 check "count survived dbd restart" "$G" "gui selftest: mode=joined count=4"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 
@@ -69,15 +82,15 @@ rm -f substrate.db   # section 4 left a persisted count; start this one clean
 ./bin/dbd >/tmp/dbd3.log 2>&1 & DP=$!; sleep 0.4
 ./bin/webd --join --port 8101 >/dev/null 2>&1 & W1=$!
 ./bin/webd --join --port 8102 >/dev/null 2>&1 & W2=$!; waitport 8102
-T=$(./bin/top --selftest 2>&1 | head -1)
+T=$($TOPSELF 2>&1 | head -1)
 check "top sees dbd + 2 webd" "$T" "top selftest: peers=3 count=0"
 curl -s localhost:8101/bump >/dev/null
-T=$(./bin/top --selftest 2>&1 | head -1)
+T=$($TOPSELF 2>&1 | head -1)
 check "top sees the shared count" "$T" "top selftest: peers=3 count=1"
 
 echo "7. dead peers are reaped by the owner"
 kill $W2 2>/dev/null; wait $W2 2>/dev/null; sleep 0.6
-T=$(./bin/top --selftest 2>&1 | head -1)
+T=$($TOPSELF 2>&1 | head -1)
 check "peer table shrank after a kill" "$T" "top selftest: peers=2 count=1"
 kill $W1 2>/dev/null; wait $W1 2>/dev/null
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
@@ -88,7 +101,7 @@ rm -f substrate.db /tmp/moved.db
 ./bin/webd --join --port 8103 >/dev/null 2>&1 & W3=$!; waitport 8103
 curl -s localhost:8103/bump >/dev/null            # -> 1, into ./substrate.db
 sleep 0.3
-TOK=$(./bin/top --token)
+TOK=$($TOPTOK)
 AUTH="X-Admin-Token: $TOK"
 MOVE="localhost:8103/admin/dbfile?path=%2Ftmp%2Fmoved.db"
 code(){ curl -s -o /dev/null -w '%{http_code}' "$@"; }
@@ -128,7 +141,7 @@ rm -f /tmp/moved.db
 echo "9. the persisted file is chosen at startup too"
 rm -f substrate.db /tmp/start.db; echo 41 > /tmp/start.db
 ./bin/dbd /tmp/start.db >/tmp/dbd5.log 2>&1 & DP=$!; sleep 0.4
-G=$(./bin/gui --selftest --join 2>&1)
+G=$($GUI --selftest --join 2>&1)
 check "dbd restored from an argv path" "$G" "gui selftest: mode=joined count=42"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null; sleep 0.3
 check "and persisted back to it" "$(cat /tmp/start.db)" "42"
@@ -136,7 +149,7 @@ check "without touching the default" "$(cat substrate.db 2>/dev/null)" ""
 rm -f /tmp/start.db
 
 echo "10. the dashboard tolerates an absent owner"
-./bin/top --selftest >/dev/null 2>&1
+$TOPSELF >/dev/null 2>&1
 check "top --selftest exits 2 with no dbd" "$?" "2"
 
 echo "11. the owner cannot be displaced, and peers survive its restart"
@@ -145,7 +158,7 @@ rm -f substrate.db
 ./bin/dbd >/tmp/dbdB.log 2>&1; RC=$?
 check "a second dbd refuses to start" "$RC" "3"
 grep -q "owner already running" /tmp/dbdB.log && ok "and says why" || bad "and says why"
-T=$(./bin/top --selftest 2>&1 | head -1)
+T=$($TOPSELF 2>&1 | head -1)
 check "the first owner is untouched" "$T" "top selftest: peers=1 count=0"
 
 ./bin/webd --join --port 8105 >/dev/null 2>&1 & W5=$!; waitport 8105
@@ -161,7 +174,7 @@ check "webd notices the owner left" "$M" "mode=detached"
 curl -s localhost:8105/status >/dev/null            # one request to revalidate
 M=$(curl -s localhost:8105/status | sed -n 2p | tr -d ' ')
 check "and re-attaches when one returns" "$M" "mode=joined"
-T=$(./bin/top --selftest 2>&1 | head -1)
+T=$($TOPSELF 2>&1 | head -1)
 check "the new owner sees the old peer" "$T" "top selftest: peers=2 count=2"
 kill $W5 2>/dev/null; wait $W5 2>/dev/null
 kill -TERM $DC 2>/dev/null; wait $DC 2>/dev/null
@@ -174,7 +187,7 @@ sleep 0.6
 grep -q "repaired a path seqlock" /tmp/dbdD.log && ok "dbd repaired the seqlock" \
                                                 || bad "dbd repaired the seqlock"
 ./bin/webd --join --port 8106 >/dev/null 2>&1 & W6=$!; waitport 8106
-TOK=$(./bin/top --token)
+TOK=$($TOPTOK)
 R=$(curl -s -X POST -H "X-Admin-Token: $TOK" \
         "localhost:8106/admin/dbfile?path=%2Ftmp%2Fafter.db" | grep -o '"ok":[a-z]*')
 check "the path still works afterwards" "$R" '"ok":true'
@@ -185,7 +198,7 @@ rm -f /tmp/after.db
 echo "13. persistence is crash-safe"
 rm -f substrate.db substrate.db.tmp
 ./bin/dbd >/tmp/dbdE.log 2>&1 & DE=$!; sleep 0.4
-./bin/gui --selftest --join >/dev/null 2>&1; sleep 0.4
+$GUI --selftest --join >/dev/null 2>&1; sleep 0.4
 check "no temp file is left behind" "$(ls substrate.db.tmp 2>/dev/null)" ""
 check "the count is there in full" "$(cat substrate.db)" "1"
 kill -TERM $DE 2>/dev/null; wait $DE 2>/dev/null
@@ -278,12 +291,28 @@ rm -f substrate.db
 ./bin/dbd >/tmp/dbdI.log 2>&1 & DI=$!; sleep 0.5
 ./bin/webd --join --port 8147 >/dev/null 2>&1 & WE=$!; waitport 8147
 curl -s localhost:8147/bump >/dev/null; curl -s localhost:8147/bump >/dev/null   # C: 2
-check "swift joins and agrees"  "$(./bin/swiftpeer --bump 3 | head -1)" "swiftpeer: bumped 3, count=5"
-check "python joins and agrees" "$(./pypeer.py --bump 4 | head -1)" "pypeer: bumped 4, count=9"
-check "C sees both of them"     "$(curl -s localhost:8147/status | head -1 | tr -d ' ')" "count=9"
-check "swift can use the ring"  "$(./bin/swiftpeer --bump 0 --reserve 5 | sed -n 2p)" "swiftpeer: reserved 5, base=1, last=5"
-check "python can use the ring" "$(./pypeer.py --bump 0 --reserve 5 | sed -n 2p)" "pypeer: reserved 5, base=6, last=10"
-check "C continues the same id space" "$(curl -s 'localhost:8147/reserve?n=2' | sed -n 2p | tr -d ' ')" "base=11"
+# Swift needs swiftc, which not every machine has. When it is missing the
+# python and C expectations shift, because each peer's bumps land in the SAME
+# cell -- so the numbers are computed, not hardcoded, and the remaining
+# languages still have to agree with each other.
+if [ -x ./bin/swiftpeer ]; then
+  check "swift joins and agrees" "$(./bin/swiftpeer --bump 3 | head -1)" "swiftpeer: bumped 3, count=5"
+  SWC=5
+else
+  skip "swift joins and agrees (no swiftc on this machine)"
+  SWC=2
+fi
+check "python joins and agrees" "$(./pypeer.py --bump 4 | head -1)" "pypeer: bumped 4, count=$((SWC+4))"
+check "C sees both of them"     "$(curl -s localhost:8147/status | head -1 | tr -d ' ')" "count=$((SWC+4))"
+if [ -x ./bin/swiftpeer ]; then
+  check "swift can use the ring" "$(./bin/swiftpeer --bump 0 --reserve 5 | sed -n 2p)" "swiftpeer: reserved 5, base=1, last=5"
+  PYBASE=6
+else
+  skip "swift can use the ring (no swiftc on this machine)"
+  PYBASE=1
+fi
+check "python can use the ring" "$(./pypeer.py --bump 0 --reserve 5 | sed -n 2p)" "pypeer: reserved 5, base=$PYBASE, last=$((PYBASE+4))"
+check "C continues the same id space" "$(curl -s 'localhost:8147/reserve?n=2' | sed -n 2p | tr -d ' ')" "base=$((PYBASE+5))"
 kill $WE 2>/dev/null; wait $WE 2>/dev/null
 kill -TERM $DI 2>/dev/null; wait $DI 2>/dev/null
 
@@ -310,7 +339,9 @@ rm -f substrate.db /tmp/pl.bin /tmp/pl.out
 ./bin/dbd >/tmp/dbdK.log 2>&1 & DK=$!; sleep 0.5
 ./bin/webd --join --port 8148 >/dev/null 2>&1 & WF=$!; waitport 8148
 head -c 900000 /dev/urandom > /tmp/pl.bin
-SHA=$(shasum -a 256 /tmp/pl.bin | cut -c1-16)
+# shasum is macOS, sha256sum is GNU. Both print the digest first.
+if command -v shasum >/dev/null 2>&1; then SHACMD="shasum -a 256"; else SHACMD="sha256sum"; fi
+SHA=$($SHACMD /tmp/pl.bin | cut -c1-16)
 
 R=$(curl -s -X PUT --data-binary @/tmp/pl.bin 'localhost:8148/blob?k=42')
 check "a 900KB payload is accepted" "$(echo "$R" | grep -o '\"ok\":true')" '"ok":true'
@@ -338,8 +369,8 @@ echo "20. another OS, another libc, and another user"
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "  SKIP  docker not available (cross-OS checks not run)"
 else
-  docker build -q -f Dockerfile.linux -t cntpipe:linux . >/dev/null 2>&1
-  OUT=$(docker run --rm cntpipe:linux bash -c '
+  docker build -q -f Dockerfile.linux -t substrate:linux . >/dev/null 2>&1
+  OUT=$(docker run --rm substrate:linux bash -c '
     ./bin/layout | awk "/^size/{print \"SIZE \" \$2} /^magic/ && !m {print \"MAGIC \" \$2; m=1}"
     ./bin/dbd >/dev/null 2>&1 & sleep 1
     echo "LOOK $(./bin/look k000000042)"

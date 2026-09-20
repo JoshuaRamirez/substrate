@@ -53,7 +53,7 @@ endif
 # Built and shipped.
 PROGS  = bin/dbd bin/webd bin/look bin/layout bin/bench $(COCOA)
 # Built, not shipped: fixtures that exist to be run by test.sh.
-FIXTURES = bin/mkdb bin/storm bin/wedge bin/hog bin/blobbench
+FIXTURES = bin/mkdb bin/storm bin/wedge bin/hog bin/blobbench bin/peer
 
 ifneq ($(shell command -v swiftc 2>/dev/null),)
   SWIFT = bin/swiftpeer
@@ -87,6 +87,7 @@ bin/bench:     bench.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/storm:     storm.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/wedge:     wedge.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/hog:       hog.c       substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
+bin/peer:      peer.c      substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/blobbench: blobbench.c substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 
 bin/webd: webd.c substrate.h emdb.h $(EMBED_DEP) | bin
