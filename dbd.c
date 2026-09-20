@@ -139,19 +139,29 @@ int main(int argc, char **argv) {
      * a housekeeper that woke ten times a second. A verb whose answer a caller
      * blocks on turns it into a server: it must spin. Housekeeping moves onto
      * a slower cadence underneath. That cost is the honest price of a reply. */
+    /* Spin hot, then park -- and measure both on a CLOCK.
+     *
+     * A ring's latency is its owner's polling interval, nothing else: sleeping
+     * 500us between polls made a 3ns memory handoff cost 620us, worse than the
+     * TCP round trip it exists to beat. So stay hot after work arrives.
+     *
+     * But "stay hot for 200000 iterations" is not a duration. Each iteration
+     * scans 32 slots, so that was 1.7 SECONDS, not the 1ms the comment
+     * claimed, and housekeeping fell 17x behind its 100ms budget. Same bug as
+     * the client's spin-count timeout, made twice in one file: an iteration
+     * count is not a unit of time on any machine you do not own. */
     uint64_t last = (uint64_t)-1;
-    int tick = 0;
-    long idle = 0;
+    int64_t hot_until = 0;
+    int64_t next_keep = cnt_now_ns();
     while (!g_stop) {
-        /* Spin hot, then park. A ring's latency is its owner's polling
-         * interval, nothing else: sleeping 500us between polls made a
-         * 3-nanosecond memory handoff cost 620 MICROseconds -- worse than the
-         * TCP round trip it was supposed to beat. So stay hot while work is
-         * arriving, and only back off once the ring has been quiet a while. */
-        if (cnt_serve_ring(g_seg)) { idle = 0; continue; }
-        if (idle < 200000) { idle++; continue; }       /* ~1ms of hot spinning */
-        if (++tick < 100) { usleep(1000); continue; }  /* then park, 100ms cycle */
-        tick = 0;
+        if (cnt_serve_ring(g_seg)) {
+            hot_until = cnt_now_ns() + 1000000;        /* 1 real millisecond */
+            continue;
+        }
+        int64_t now_ns = cnt_now_ns();
+        if (now_ns < hot_until) continue;              /* still hot */
+        if (now_ns < next_keep) { usleep(200); continue; }
+        next_keep = now_ns + 100000000;                /* housekeep at 10 Hz */
         if (cnt_seqlock_repair(g_seg)) {
             printf("dbd: repaired a path seqlock left odd by a dead writer\n");
             fflush(stdout);

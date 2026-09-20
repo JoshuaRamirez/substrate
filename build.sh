@@ -22,7 +22,10 @@ fi
 EMDB_N="${EMDB_N:-1000000}"
 clang -O2 -std=c11 mkdb.c -o bin/mkdb
 [ -f db.blob ] || ./bin/mkdb "$EMDB_N" db.blob
-EMBED="-Wl,-sectcreate,__TEXT,__emdb,db.blob"
+# -sectalign matters: emdb_rec holds a uint64_t, and a section the linker
+# placed on an odd address makes every read of it undefined behaviour. UBSan
+# caught this; arm64 tolerated it silently, which is exactly the problem.
+EMBED="-Wl,-sectcreate,__TEXT,__emdb,db.blob -Wl,-sectalign,__TEXT,__emdb,8"
 
 # shellcheck disable=SC2086
 clang $OPT $WARN $HARD -std=c11 dbd.c  -o $OUT/dbd
