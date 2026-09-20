@@ -491,6 +491,14 @@ three of them found bugs on the way. What is honestly left:
   built at different times cannot share a substrate at all.
 - **Capability partitioning.** Anything that can map the segment can write
   every byte of it. The boundary is a file mode, not per-region permissions.
+- **What a timed-out call actually did.** `sub_call` waits a bounded 2 seconds
+  and then gives up. But the owner may have served the request in the
+  meantime, so a caller that times out cannot tell whether its ids were spent.
+  They are gone either way. Under ASan on a small machine this is observable:
+  at 128 clients the suite sees a handful of timeouts and a matching gap in
+  the id range. Duplicates stay at zero — nothing is ever handed out twice —
+  but "reserved and lost" is a state the caller cannot distinguish from
+  "never reserved". A two-phase reservation would close it.
 - **More than one machine.** Not a gap — a boundary. See above.
 
 ## Sizes
@@ -520,6 +528,13 @@ the executable*.
 | `swiftpeer` | if `swiftc` is present | if `swiftc` is present |
 | `pypeer.py` | libSystem atomics | libatomic atomics |
 | `./test.sh` | 108 pass | 97 pass, 3 skip |
+
+Under `make san` the suite runs 102 checks, not 108: instrumentation makes
+the owner slow enough that the 2-second call timeout is genuinely reachable
+at 128 clients, so the contention section asserts the invariant that actually
+holds there — no duplicates ever, and every gap in the id range explained by
+a *reported* timeout. A gap with no timeout to explain it is the silent id
+leak this project has already fixed twice, and that check stays strict.
 
 The segment is **67,141,632 bytes on both**, byte for byte, and both compute
 the same magic. That is asserted in CI, not just printed: if the two ever
