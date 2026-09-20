@@ -1,4 +1,4 @@
-# counter-pipeline
+# substrate
 
 The absolute minimal prototype of a common-process executable pipeline.
 
@@ -61,7 +61,7 @@ Where `dbd` persists is not baked into `dbd`. It is **in the shared page**,
 so any peer can change it while everything is running:
 
 ```sh
-./bin/dbd /path/to/my.db              # or: COUNTER_DB=/path/to/my.db ./bin/dbd
+./bin/dbd /path/to/my.db              # or: SUBSTRATE_DB=/path/to/my.db ./bin/dbd
 curl -X POST -H "X-Admin-Token: $(./bin/top --token)" \\
      "localhost:8080/admin/dbfile?path=/tmp/other.db"     # move it, live
 ```
@@ -91,7 +91,7 @@ native dashboard needs no token.
 ## The admin layer
 
 **The trust boundary is the shm file mode, not a password.** Anything that can
-map `/cnt.v7` can already write every value in it, so peers are inside by
+map `/sub.v8` can already write every value in it, so peers are inside by
 construction — `bin/top` moves the database with no token and no prompt. It
 does not ask permission, because asking would be theatre.
 
@@ -129,14 +129,14 @@ needs a lock. The path is neither: it is 256 bytes, and any peer may write it.
 So it gets the smallest protocol that works — a **seqlock**. Writers take a
 sequence counter odd, copy, put it back even. Readers copy, then check the
 sequence did not move under them, and retry if it did. About twenty lines in
-`counter.h`, no mutex, no blocking, and readers never stall a writer.
+`substrate.h`, no mutex, no blocking, and readers never stall a writer.
 
 This is the same "publish last" shape `dbd` already used for `magic`,
 generalised from one word to a buffer.
 
 ## The mode switch is one pointer
 
-`counter.h` is the thesis. The two modes differ by which memory a pointer
+`substrate.h` is the thesis. The two modes differ by which memory a pointer
 points at:
 
 ```c
@@ -144,7 +144,7 @@ alone   ->  c.cell = &c.own    /* private memory in this process */
 joined  ->  c.cell = &seg->count   /* a page shared by every peer */
 ```
 
-`counter_bump()` and `counter_read()` are byte-identical in both modes.
+`sub_bump()` and `sub_read()` are byte-identical in both modes.
 There is not even a branch on the hot path. Every call site above them —
 the HTTP handler, the mouseDown, the frame loop — is mode-blind. Exactly
 one line in each binary knows which mode it is in, and it is the
@@ -221,7 +221,7 @@ That output **is** the interface.
 
 | Peer | Toolchain | How it joins |
 |---|---|---|
-| `webd`, `gui`, `top` | clang / Objective-C | the `counter.h` header |
+| `webd`, `gui`, `top` | clang / Objective-C | the `substrate.h` header |
 | `bin/swiftpeer` | Swift 6.3 | its own `shm_open` (via `dlsym` — it's variadic), own `mmap`, own atomics. No Foundation, no C shim |
 | `pypeer.py` | CPython + ctypes | `shm_open`, `mmap` and the OSAtomic primitives through libSystem. Real atomics, not the GIL |
 
@@ -238,7 +238,7 @@ read garbage and call it agreement.
 
 ## The verb that waits
 
-`counter_reserve(n)` is the one call whose answer the caller needs back. Alone
+`sub_reserve(n)` is the one call whose answer the caller needs back. Alone
 it is an add on private memory; joined it is a ring round trip. **Same call
 site.** That was the untested half of the whole claim.
 
@@ -351,7 +351,7 @@ Feature macros pull in *opposite* directions and the header now knows it:
 glibc hides `clock_gettime` under strict `-std=c11` unless you ask for POSIX
 2008; Apple's libc **hides the BSD extensions** if you do ask.
 
-**Another user cannot join.** `/dev/shm/cnt.v7` is mode `600`, and a second uid
+**Another user cannot join.** `/dev/shm/sub.v8` is mode `600`, and a second uid
 on the same machine gets "no owner" and exits non-zero. The trust boundary is
 not a convention — the kernel enforces it.
 
@@ -405,7 +405,7 @@ Run `./test.sh`.
 | Native GUI forces a system-installed toolkit | **not falsified** — Cocoa is the OS; `bin/gui` is 53K |
 | The binaries need a shared runtime or launcher to find each other | **not falsified** — one shm name, no discovery |
 | The shared cell needs a lock, and the lock needs a protocol | **not falsified** — see below |
-| A reply-carrying verb forces a ring, and the ring breaks the one-pointer property | **not falsified** — the ring exists, `counter_reserve` needs it, and the call site still does not change |
+| A reply-carrying verb forces a ring, and the ring breaks the one-pointer property | **not falsified** — the ring exists, `sub_reserve` needs it, and the call site still does not change |
 | A second language cannot join without a C shim | **not falsified** — Swift and Python both join on the format alone |
 
 The fourth one fired, and it is worth being exact about how.
@@ -430,7 +430,7 @@ three of them found bugs on the way. What is honestly left:
 
 - **Fairness.** No client starves in practice, but nothing *guarantees* it.
   Slot claiming is a scan from index 0, so it is biased, not queued.
-- **Mixed-version coexistence.** v6 and v7 flatly refuse each other. Peers
+- **Mixed-version coexistence.** v7 and v8 flatly refuse each other. Peers
   built at different times cannot share a substrate at all.
 - **Capability partitioning.** Anything that can map the segment can write
   every byte of it. The boundary is a file mode, not per-region permissions.

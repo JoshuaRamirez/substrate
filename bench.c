@@ -10,7 +10,7 @@
  *
  * The first four are the claim. The last two are what the claim is against.
  */
-#include "counter.h"
+#include "substrate.h"
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -54,17 +54,17 @@ int main(int argc, char **argv) {
     long N = 2000000, R = 20000, S = 20000;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--join")) join = 1;
 
-    counter C;
-    if (counter_open(&C, join, "bench", "bench") < 0) return 2;
-    printf("bench: mode=%s\n", counter_mode(&C));
+    substrate C;
+    if (sub_open(&C, join, "bench", "bench") < 0) return 2;
+    printf("bench: mode=%s\n", sub_mode(&C));
 
     /* --- the shared-memory side --- */
     double t0 = now_ns();
-    for (long i = 0; i < N; i++) counter_bump(&C);
+    for (long i = 0; i < N; i++) sub_bump(&C);
     row(join ? "bump joined" : "bump alone", (now_ns() - t0) / (double)N, N);
 
     t0 = now_ns();
-    for (long i = 0; i < R; i++) if (!counter_reserve(&C, 1)) { R = i ? i : 1; break; }
+    for (long i = 0; i < R; i++) if (!sub_reserve(&C, 1)) { R = i ? i : 1; break; }
     row(join ? "reserve joined (ring)" : "reserve alone", (now_ns() - t0) / (double)R, R);
 
     /* --- what it is being compared against --- */
@@ -96,6 +96,6 @@ int main(int argc, char **argv) {
         close(cli); close(srv);
     }
 
-    counter_close(&C);
+    sub_close(&C);
     return 0;
 }

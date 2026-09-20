@@ -25,7 +25,7 @@
  *          with the arena you pay for what you READ, with a socket you pay for
  *          what was SENT. The socket has to move all N bytes either way.
  */
-#include "counter.h"
+#include "substrate.h"
 #include <stdlib.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -91,8 +91,8 @@ int main(int argc, char **argv) {
     int join = 0;
     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--join")) join = 1;
 
-    counter C;
-    if (counter_open(&C, join, "blobbench", "bench") < 0) return 2;
+    substrate C;
+    if (sub_open(&C, join, "blobbench", "bench") < 0) return 2;
     if (!C.seg) { fprintf(stderr, "blobbench: needs --join and a running dbd\n"); return 2; }
 
     size_t sizes[] = { 4096, 65536, 1048576 };
@@ -105,7 +105,7 @@ int main(int argc, char **argv) {
         for (size_t i = 0; i < n; i++) src[i] = (uint8_t)(i * 31 + si);
         uint64_t want = sum_bytes(src, n), chk = 0;
 
-        if (counter_put(&C, 1000 + si, src, n) != 0) {
+        if (sub_put(&C, 1000 + si, src, n) != 0) {
             fprintf(stderr, "blobbench: put failed (arena full?)\n");
             return 3;
         }
@@ -114,7 +114,7 @@ int main(int argc, char **argv) {
         double t0 = now_ns();
         for (long i = 0; i < iters; i++) {
             uint64_t len = 0;
-            const uint8_t *p = counter_get(&C, 1000 + si, &len);
+            const uint8_t *p = sub_get(&C, 1000 + si, &len);
             if (!p || len != n) { fprintf(stderr, "get failed\n"); return 4; }
             chk += sum_bytes(p, (size_t)len);          /* no copy: read where it lives */
         }
@@ -141,7 +141,7 @@ int main(int argc, char **argv) {
             double t1 = now_ns();
             for (long i = 0; i < iters; i++) {
                 uint64_t len = 0;
-                const uint8_t *p = counter_get(&C, 1000 + si, &len);
+                const uint8_t *p = sub_get(&C, 1000 + si, &len);
                 if (!p) return 6;
                 pc += probe_bytes(p, (size_t)len);
             }
@@ -173,6 +173,6 @@ int main(int argc, char **argv) {
         free(src); free(dst);
         printf("\n");
     }
-    counter_close(&C);
+    sub_close(&C);
     return 0;
 }

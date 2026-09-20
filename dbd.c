@@ -9,12 +9,12 @@
  * and the owner picks it up on its next tick. Save As, not Open -- the count
  * keeps counting; only its destination changes.
  */
-#include "counter.h"
+#include "substrate.h"
 #include <stdlib.h>
 
-static char      DBFILE[CNT_PATHLEN] = "counter.db";
-static cnt_seg  *g_seg  = NULL;
-static cnt_peer *g_self = NULL;
+static char      DBFILE[SUB_PATHLEN] = "substrate.db";
+static sub_seg  *g_seg  = NULL;
+static sub_peer *g_self = NULL;
 static volatile sig_atomic_t g_stop = 0;
 
 static void on_signal(int _) { (void)_; g_stop = 1; }
@@ -32,7 +32,7 @@ static uint64_t load_persisted(void) {
  * truncated file that reads back as 0 -- silently losing the count it was
  * supposed to protect. rename(2) is atomic on the same filesystem. */
 static int persist_to(const char *file, uint64_t v) {
-    char tmp[CNT_PATHLEN + 8];
+    char tmp[SUB_PATHLEN + 8];
     if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", file) >= sizeof tmp) return -1;
     FILE *f = fopen(tmp, "w");
     if (!f) return -1;
@@ -56,7 +56,7 @@ static void retarget(const char *want) {
     if (persist_to(want, now) < 0) {
         printf("dbd: refused %s (%s) -- staying on %s\n",
                want, strerror(errno), DBFILE);
-        cnt_path_write(g_seg, DBFILE);
+        sub_path_write(g_seg, DBFILE);
         fflush(stdout);
         return;
     }
@@ -75,10 +75,10 @@ int main(int argc, char **argv) {
      * whose working directory is not ours. */
     const char *want = NULL;
     for (int i = 1; i < argc; i++) if (argv[i][0] != '-') { want = argv[i]; break; }
-    if (!want) want = getenv("COUNTER_DB");
-    if (!want) want = "counter.db";
-    char abs[CNT_PATHLEN];
-    cnt_abspath(want, abs, sizeof abs);
+    if (!want) want = getenv("SUBSTRATE_DB");
+    if (!want) want = "substrate.db";
+    char abs[SUB_PATHLEN];
+    sub_abspath(want, abs, sizeof abs);
     snprintf(DBFILE, sizeof DBFILE, "%s", abs);
 
     /* Clear any stale segment: on macOS an shm object can only be ftruncate'd
@@ -88,48 +88,48 @@ int main(int argc, char **argv) {
      * the old page, and the two worlds diverged in silence. Check first. */
     {
         int err = 0;
-        cnt_seg *existing = cnt_attach(&err);
+        sub_seg *existing = sub_attach(&err);
         if (existing) {
-            int live = cnt_owner_alive(existing);
+            int live = sub_owner_alive(existing);
             pid_t who = (pid_t)atomic_load(&existing->owner_pid);
             munmap(existing, sizeof *existing);
             if (live) {
                 fprintf(stderr, "dbd: refusing to start -- owner already running "
-                                "on %s (pid %d)\n", CNT_SHM_NAME, who);
+                                "on %s (pid %d)\n", SUB_SHM_NAME, who);
                 return 3;
             }
         }
     }
-    shm_unlink(CNT_SHM_NAME);
+    shm_unlink(SUB_SHM_NAME);
 
-    int fd = shm_open(CNT_SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
+    int fd = shm_open(SUB_SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) { perror("shm_open"); return 1; }
     /* No fchmod here: macOS rejects it on an shm descriptor (EINVAL), and it
      * is not needed -- umask can only CLEAR permission bits, never add them,
      * so 0600 cannot be widened into something group- or world-readable. */
-    if (ftruncate(fd, sizeof(cnt_seg)) < 0) { perror("ftruncate"); return 1; }
+    if (ftruncate(fd, sizeof(sub_seg)) < 0) { perror("ftruncate"); return 1; }
 
-    void *p = mmap(NULL, sizeof(cnt_seg), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    void *p = mmap(NULL, sizeof(sub_seg), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
     if (p == MAP_FAILED) { perror("mmap"); return 1; }
 
-    g_seg = (cnt_seg *)p;
+    g_seg = (sub_seg *)p;
     uint64_t start = load_persisted();
     atomic_store(&g_seg->count, start);
     atomic_store(&g_seg->path_seq, 0);
-    cnt_path_write(g_seg, DBFILE);       /* publish where the data actually goes */
+    sub_path_write(g_seg, DBFILE);       /* publish where the data actually goes */
     atomic_store(&g_seg->owner_pid, (uint64_t)getpid());
     atomic_store(&g_seg->path_writer, 0);
     atomic_store(&g_seg->next_id, 1);   /* id 0 means "failed" */
     atomic_store(&g_seg->block_free, ~0ull);   /* every arena block free */
-    cnt_mint_admin(g_seg);        /* before magic: no peer sees a tokenless segment */
-    g_seg->version = CNT_VERSION;
-    g_seg->magic   = CNT_MAGIC;   /* magic last: peers see a valid segment or none */
+    sub_mint_admin(g_seg);        /* before magic: no peer sees a tokenless segment */
+    g_seg->version = SUB_VERSION;
+    g_seg->magic   = SUB_MAGIC;   /* magic last: peers see a valid segment or none */
 
-    g_self = cnt_claim_slot(g_seg, "dbd", "owner");
+    g_self = sub_claim_slot(g_seg, "dbd", "owner");
 
     printf("dbd: owning %s  (format v%u, %zu bytes, %d slots)  restored count=%llu\n",
-           CNT_SHM_NAME, CNT_VERSION, sizeof(cnt_seg), CNT_MAX_PEERS,
+           SUB_SHM_NAME, SUB_VERSION, sizeof(sub_seg), SUB_MAX_PEERS,
            (unsigned long long)start);
     printf("dbd: database %s\n", DBFILE);
     printf("dbd: admin token minted (%s)\n",
@@ -153,27 +153,27 @@ int main(int argc, char **argv) {
      * count is not a unit of time on any machine you do not own. */
     uint64_t last = (uint64_t)-1;
     int64_t hot_until = 0;
-    int64_t next_keep = cnt_now_ns();
+    int64_t next_keep = sub_now_ns();
     while (!g_stop) {
-        if (cnt_serve_ring(g_seg)) {
-            hot_until = cnt_now_ns() + 1000000;        /* 1 real millisecond */
+        if (sub_serve_ring(g_seg)) {
+            hot_until = sub_now_ns() + 1000000;        /* 1 real millisecond */
             continue;
         }
-        int64_t now_ns = cnt_now_ns();
+        int64_t now_ns = sub_now_ns();
         if (now_ns < hot_until) continue;              /* still hot */
         if (now_ns < next_keep) { usleep(200); continue; }
         next_keep = now_ns + 100000000;                /* housekeep at 10 Hz */
-        if (cnt_seqlock_repair(g_seg)) {
+        if (sub_seqlock_repair(g_seg)) {
             printf("dbd: repaired a path seqlock left odd by a dead writer\n");
             fflush(stdout);
         }
-        cnt_reap_ring(g_seg);
-        cnt_reap_blocks(g_seg);
-        int reaped = cnt_reap(g_seg);
+        sub_reap_ring(g_seg);
+        sub_reap_blocks(g_seg);
+        int reaped = sub_reap(g_seg);
         if (reaped) { printf("dbd: reaped %d dead peer(s)\n", reaped); fflush(stdout); }
 
-        char asked[CNT_PATHLEN];
-        if (cnt_path_read(g_seg, asked, sizeof asked) && strcmp(asked, DBFILE) != 0)
+        char asked[SUB_PATHLEN];
+        if (sub_path_read(g_seg, asked, sizeof asked) && strcmp(asked, DBFILE) != 0)
             retarget(asked);
 
         uint64_t now = atomic_load(&g_seg->count);
@@ -187,10 +187,10 @@ int main(int argc, char **argv) {
 
     uint64_t final = atomic_load(&g_seg->count);
     persist(final);
-    cnt_release_slot(g_self);
+    sub_release_slot(g_self);
     g_seg->magic = 0;              /* revoke: late joiners must not attach */
-    munmap(g_seg, sizeof(cnt_seg));
-    shm_unlink(CNT_SHM_NAME);
+    munmap(g_seg, sizeof(sub_seg));
+    shm_unlink(SUB_SHM_NAME);
     printf("\ndbd: stopped, persisted count=%llu to %s\n",
            (unsigned long long)final, DBFILE);
     return 0;

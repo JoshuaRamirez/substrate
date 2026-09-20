@@ -12,7 +12,7 @@
  *   it LOSE? A full ring is a full queue, not a failure, and the difference
  *   is whether a request comes back late or never comes back at all.
  */
-#include "counter.h"
+#include "substrate.h"
 #include <stdlib.h>
 #include <sys/wait.h>
 
@@ -28,14 +28,14 @@ int main(int argc, char **argv) {
     if (per < 1) per = 1;
 
     printf("storm: %d client processes x %ld reserves, on %d ring slots\n",
-           clients, per, CNT_RING_SLOTS);
+           clients, per, SUB_RING_SLOTS);
     fflush(stdout);
 
-    int64_t t0 = cnt_now_ns();
+    int64_t t0 = sub_now_ns();
     for (int i = 0; i < clients; i++) {
         if (fork() == 0) {
-            counter C;
-            if (counter_open(&C, 1, "storm", "load") < 0) _exit(9);   /* parent counts these */
+            substrate C;
+            if (sub_open(&C, 1, "storm", "load") < 0) _exit(9);   /* parent counts these */
 
             uint64_t *got = malloc((size_t)per * sizeof(uint64_t));
             int64_t  *lat = malloc((size_t)per * sizeof(int64_t));
@@ -43,9 +43,9 @@ int main(int argc, char **argv) {
 
             long lost = 0;
             for (long k = 0; k < per; k++) {
-                int64_t a = cnt_now_ns();
-                uint64_t id = counter_reserve(&C, 1);
-                lat[k] = cnt_now_ns() - a;
+                int64_t a = sub_now_ns();
+                uint64_t id = sub_reserve(&C, 1);
+                lat[k] = sub_now_ns() - a;
                 got[k] = id;
                 if (id == 0) lost++;             /* dropped: backpressure failed */
             }
@@ -65,7 +65,7 @@ int main(int argc, char **argv) {
                         (long long)lat[per - 1]);
                 fclose(fp);
             }
-            counter_close(&C);
+            sub_close(&C);
             _exit(0);
         }
     }
@@ -75,7 +75,7 @@ int main(int argc, char **argv) {
         wait(&st);
         if (WIFEXITED(st) && WEXITSTATUS(st) == 0) joined++; else failed++;
     }
-    double secs = (double)(cnt_now_ns() - t0) / 1e9;
+    double secs = (double)(sub_now_ns() - t0) / 1e9;
 
     /* ---- did every id come out exactly once? ---- */
     size_t total = (size_t)clients * (size_t)per;

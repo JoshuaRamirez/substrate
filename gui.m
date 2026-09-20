@@ -7,9 +7,9 @@
  * looks like when you draw it.
  */
 #import <Cocoa/Cocoa.h>
-#include "counter.h"
+#include "substrate.h"
 
-static counter C;
+static substrate C;
 static NSRect BTN;
 
 @interface CounterView : NSView
@@ -25,10 +25,10 @@ static NSRect BTN;
     NSRectFill(b);
 
     /* ---- every frame: confirm the owner, then read straight off the page ----
-     * If dbd went away, counter_mode() turns "detached" and the title says so,
+     * If dbd went away, sub_mode() turns "detached" and the title says so,
      * rather than this window quietly showing a number nobody else shares. */
-    counter_revalidate(&C);
-    uint64_t v = counter_read(&C);
+    sub_revalidate(&C);
+    uint64_t v = sub_read(&C);
 
     NSDictionary *big = @{
         NSFontAttributeName : [NSFont monospacedDigitSystemFontOfSize:76
@@ -45,7 +45,7 @@ static NSRect BTN;
                                                           weight:NSFontWeightRegular],
         NSForegroundColorAttributeName : [NSColor colorWithCalibratedWhite:0.55 alpha:1.0]
     };
-    NSString *mode = [NSString stringWithFormat:@"mode = %s", counter_mode(&C)];
+    NSString *mode = [NSString stringWithFormat:@"mode = %s", sub_mode(&C)];
     NSSize ms = [mode sizeWithAttributes:small];
     [mode drawAtPoint:NSMakePoint((b.size.width - ms.width) / 2, 108)
        withAttributes:small];
@@ -68,14 +68,14 @@ static NSRect BTN;
 - (void)mouseDown:(NSEvent *)e {
     NSPoint p = [self convertPoint:e.locationInWindow fromView:nil];
     if (NSPointInRect(p, BTN)) {
-        counter_bump(&C);              /* identical call site */
+        sub_bump(&C);              /* identical call site */
         [self setNeedsDisplay:YES];
     }
 }
 
 - (void)tick:(NSTimer *)t {
     (void)t;
-    [[self window] setTitle:[NSString stringWithFormat:@"counter (%s)", counter_mode(&C)]];
+    [[self window] setTitle:[NSString stringWithFormat:@"counter (%s)", sub_mode(&C)]];
     [self setNeedsDisplay:YES];
 }
 
@@ -89,15 +89,15 @@ int main(int argc, const char **argv) {
     }
 
     if (selftest) {                    /* same data path, no window */
-        if (counter_open(&C, join, "gui", "ui") < 0) return 2;
-        uint64_t v = counter_bump(&C);
-        printf("gui selftest: mode=%s count=%llu\n", counter_mode(&C),
+        if (sub_open(&C, join, "gui", "ui") < 0) return 2;
+        uint64_t v = sub_bump(&C);
+        printf("gui selftest: mode=%s count=%llu\n", sub_mode(&C),
                (unsigned long long)v);
-        counter_close(&C);
+        sub_close(&C);
         return 0;
     }
 
-    if (counter_open(&C, join, "gui", "ui") < 0) return 2;   /* <- the only mode-aware line */
+    if (sub_open(&C, join, "gui", "ui") < 0) return 2;   /* <- the only mode-aware line */
 
     @autoreleasepool {
         [NSApplication sharedApplication];
@@ -111,7 +111,7 @@ int main(int argc, const char **argv) {
                                  NSWindowStyleMaskMiniaturizable)
                         backing:NSBackingStoreBuffered
                           defer:NO];
-        [w setTitle:[NSString stringWithFormat:@"counter (%s)", counter_mode(&C)]];
+        [w setTitle:[NSString stringWithFormat:@"counter (%s)", sub_mode(&C)]];
         [w center];
 
         CounterView *v = [[CounterView alloc] initWithFrame:frame];

@@ -37,7 +37,7 @@
  * It holds no state. Kill it and start a new one and nothing is lost, because
  * the state was never here -- it is in the owner's page.
  */
-#include "counter.h"
+#include "substrate.h"
 #include "emdb.h"
 #include <stdlib.h>
 #include <netinet/in.h>
@@ -45,11 +45,11 @@
 #include <arpa/inet.h>
 #include <ctype.h>
 
-static counter C;
+static substrate C;
 static emdb    DB;      /* in-process, read-only, mapped from our own image */
 
 static const char PAGE[] =
-"<!doctype html><meta charset=utf-8><title>counter</title>"
+"<!doctype html><meta charset=utf-8><title>substrate</title>"
 "<style>"
 "body{background:#171717;color:#eee;font:13px ui-monospace,Menlo,monospace;"
 "margin:0;padding:34px 30px;-webkit-font-smoothing:antialiased}"
@@ -164,7 +164,7 @@ static void jsonesc(const char *in, char *out, size_t cap) {
 
 /* Where the owner is persisting, as this process sees it. */
 static void dbfile_now(char *out, size_t cap) {
-    if (!C.seg || !cnt_path_read(C.seg, out, cap) || !out[0])
+    if (!C.seg || !sub_path_read(C.seg, out, cap) || !out[0])
         snprintf(out, cap, "(none)");
 }
 
@@ -192,20 +192,20 @@ static void reply(int fd, const char *status, const char *ctype, const char *bod
 /* The peer table, rendered for the browser. Same rows `top` draws. */
 static void json_state(char *out, size_t cap) {
     size_t k = 0;
-    char db[CNT_PATHLEN], dbj[CNT_PATHLEN * 2];
+    char db[SUB_PATHLEN], dbj[SUB_PATHLEN * 2];
     dbfile_now(db, sizeof db);
     jsonesc(db, dbj, sizeof dbj);
     k += snprintf(out + k, cap - k,
         "{\"count\":%llu,\"mode\":\"%s\",\"shm\":\"%s\",\"version\":%u,"
         "\"dbfile\":\"%s\",\"peers\":[",
-        (unsigned long long)counter_read(&C), counter_mode(&C),
-        C.joined ? CNT_SHM_NAME : "(none)", CNT_VERSION, dbj);
+        (unsigned long long)sub_read(&C), sub_mode(&C),
+        C.joined ? SUB_SHM_NAME : "(none)", SUB_VERSION, dbj);
 
     int first = 1;
     if (C.seg) {
-        for (int i = 0; i < CNT_MAX_PEERS && k < cap - 128; i++) {
-            cnt_peer *p = &C.seg->peers[i];
-            if (!cnt_peer_alive(p)) continue;
+        for (int i = 0; i < SUB_MAX_PEERS && k < cap - 128; i++) {
+            sub_peer *p = &C.seg->peers[i];
+            if (!sub_peer_alive(p)) continue;
             k += snprintf(out + k, cap - k,
                 "%s{\"name\":\"%s\",\"role\":\"%s\",\"pid\":%llu,\"ops\":%llu}",
                 first ? "" : ",", p->name, p->role,
@@ -223,18 +223,18 @@ int main(int argc, char **argv) {
         if (!strcmp(argv[i], "--join")) join = 1;
         else if (!strcmp(argv[i], "--port") && i + 1 < argc) port = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--selftest")) {
-            if (counter_open(&C, join, "webd", "http") < 0) return 2;
-            uint64_t v = counter_bump(&C);
-            printf("webd selftest: mode=%s count=%llu\n", counter_mode(&C),
+            if (sub_open(&C, join, "webd", "http") < 0) return 2;
+            uint64_t v = sub_bump(&C);
+            printf("webd selftest: mode=%s count=%llu\n", sub_mode(&C),
                    (unsigned long long)v);
-            counter_close(&C);
+            sub_close(&C);
             return 0;
         }
     }
     signal(SIGPIPE, SIG_IGN);
 
     emdb_open(&DB);                        /* no I/O: dyld already mapped it */
-    if (counter_open(&C, join, "webd", "http") < 0) return 2;  /* only mode-aware line */
+    if (sub_open(&C, join, "webd", "http") < 0) return 2;  /* only mode-aware line */
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int yes = 1;
@@ -250,7 +250,7 @@ int main(int argc, char **argv) {
     if (listen(srv, 32) < 0) { perror("listen"); return 1; }
 
     printf("webd: listening on http://127.0.0.1:%d  mode=%s  pid=%d\n",
-           port, counter_mode(&C), getpid());
+           port, sub_mode(&C), getpid());
     fflush(stdout);
 
     for (;;) {
@@ -280,7 +280,7 @@ int main(int argc, char **argv) {
         buf[have] = 0;
 
         /* Did our owner go away, or come back? Cheap, once per request. */
-        counter_revalidate(&C);
+        sub_revalidate(&C);
 
         char method[8] = {0}, path[256] = {0};
         sscanf(buf, "%7s %255s", method, path);
@@ -291,7 +291,7 @@ int main(int argc, char **argv) {
              * but the same-origin policy forbids it reading the response, so
              * this hands the credential to your tab and to nobody else. */
             static char page[sizeof PAGE + 64];
-            char tokj[CNT_TOKLEN + 8];
+            char tokj[SUB_TOKLEN + 8];
             snprintf(tokj, sizeof tokj, "'%s'", (C.seg && C.seg->admin[0]) ? C.seg->admin : "");
             const char *mark = strstr(PAGE, "%TOKEN%");
             if (!mark) {                       /* template broken at build time */
@@ -306,17 +306,17 @@ int main(int argc, char **argv) {
             json_state(body, sizeof body);
             reply(fd, "200 OK", "application/json", body);
         } else if (!strcmp(path, "/api/bump")) {
-            counter_bump(&C);                             /* identical call site */
+            sub_bump(&C);                             /* identical call site */
             json_state(body, sizeof body);
             reply(fd, "200 OK", "application/json", body);
         } else if (!strcmp(path, "/bump")) {
-            uint64_t v = counter_bump(&C);                /* identical call site */
+            uint64_t v = sub_bump(&C);                /* identical call site */
             snprintf(body, sizeof body, "bumped\ncount = %llu\nmode  = %s\n",
-                     (unsigned long long)v, counter_mode(&C));
+                     (unsigned long long)v, sub_mode(&C));
             reply(fd, "200 OK", "text/plain; charset=utf-8", body);
         } else if (!strncmp(path, "/admin/dbfile", 13)) {
             /* Admin. Gated three ways: method, custom header, unguessable token. */
-            char tok[CNT_TOKLEN * 2] = {0};
+            char tok[SUB_TOKLEN * 2] = {0};
             header(buf, "X-Admin-Token", tok, sizeof tok);
 
             if (strcmp(method, "POST") != 0) {
@@ -325,17 +325,17 @@ int main(int argc, char **argv) {
             } else if (!C.seg) {
                 reply(fd, "409 Conflict", "application/json",
                       "{\"ok\":false,\"detail\":\"not joined -- this webd owns no segment\"}");
-            } else if (!cnt_admin_ok(C.seg, tok)) {
+            } else if (!sub_admin_ok(C.seg, tok)) {
                 reply(fd, "401 Unauthorized", "application/json",
                       "{\"ok\":false,\"detail\":\"X-Admin-Token missing or wrong\"}");
             } else {
                 const char *q = strstr(path, "?path=");
-                char want[CNT_PATHLEN] = {0};
-                int rc = q ? (urldec(q + 6, want, sizeof want), cnt_path_write(C.seg, want))
+                char want[SUB_PATHLEN] = {0};
+                int rc = q ? (urldec(q + 6, want, sizeof want), sub_path_write(C.seg, want))
                            : -8;
                 const char *msg = rc == -8 ? "usage: POST /admin/dbfile?path=/absolute/path"
-                                           : cnt_path_error(rc);
-                char wj[CNT_PATHLEN * 2];
+                                           : sub_path_error(rc);
+                char wj[SUB_PATHLEN * 2];
                 jsonesc(want, wj, sizeof wj);
                 snprintf(body, sizeof body,
                          "{\"ok\":%s,\"requested\":\"%s\",\"detail\":\"%s\"}",
@@ -348,16 +348,16 @@ int main(int argc, char **argv) {
             const char *q = strstr(path, "?n=");
             uint64_t n = q ? strtoull(q + 3, NULL, 10) : 1;
             if (n == 0 || n > 1000000) n = 1;
-            uint64_t base = counter_reserve(&C, n);        /* identical call site */
+            uint64_t base = sub_reserve(&C, n);        /* identical call site */
             if (base)
                 snprintf(body, sizeof body,
                          "reserved %llu ids\nbase  = %llu\nlast  = %llu\nmode  = %s\n",
                          (unsigned long long)n, (unsigned long long)base,
-                         (unsigned long long)(base + n - 1), counter_mode(&C));
+                         (unsigned long long)(base + n - 1), sub_mode(&C));
             else
                 snprintf(body, sizeof body,
                          "reserve failed (ring full, or the owner went away)\nmode  = %s\n",
-                         counter_mode(&C));
+                         sub_mode(&C));
             reply(fd, base ? "200 OK" : "503 Service Unavailable",
                   "text/plain; charset=utf-8", body);
         } else if (!strncmp(path, "/lookup", 7)) {
@@ -391,13 +391,13 @@ int main(int argc, char **argv) {
                 size_t got = b ? have - (size_t)((b + 4) - buf) : 0;
 
                 int rc;
-                if (!want || want > CNT_BLOCK_SIZE) {
+                if (!want || want > SUB_BLOCK_SIZE) {
                     rc = -1;
                 } else {
-                    int blk = cnt_block_alloc(C.seg);
+                    int blk = sub_block_alloc(C.seg);
                     if (blk < 0) { rc = -2; }            /* arena full: real backpressure */
                     else {
-                        uint8_t *dst = cnt_block_ptr(C.seg, blk);
+                        uint8_t *dst = sub_block_ptr(C.seg, blk);
                         if (got) memcpy(dst, b + 4, got > want ? (size_t)want : got);
                         size_t off = got > want ? (size_t)want : got;
                         while (off < want) {
@@ -405,20 +405,20 @@ int main(int argc, char **argv) {
                             if (r <= 0) break;
                             off += (size_t)r;
                         }
-                        rc = (off == want) ? counter_publish(&C, key, blk, want) : -4;
-                        if (rc != 0 && off != want) cnt_block_free(C.seg, blk);
+                        rc = (off == want) ? sub_publish(&C, key, blk, want) : -4;
+                        if (rc != 0 && off != want) sub_block_free(C.seg, blk);
                         got = off;
                     }
                 }
                 snprintf(body, sizeof body,
                          "{\"ok\":%s,\"key\":%llu,\"len\":%zu,\"blocks_free\":%d}",
                          rc == 0 ? "true" : "false", (unsigned long long)key, got,
-                         cnt_blocks_free(C.seg));
+                         sub_blocks_free(C.seg));
                 reply(fd, rc == 0 ? "200 OK" : "507 Insufficient Storage",
                       "application/json", body);
             } else {
                 uint64_t len = 0;
-                const uint8_t *p = counter_get(&C, key, &len);
+                const uint8_t *p = sub_get(&C, key, &len);
                 if (!p || !len) {
                     reply(fd, "404 Not Found", "text/plain; charset=utf-8", "no such blob\n");
                 } else {
@@ -435,11 +435,11 @@ int main(int argc, char **argv) {
                 }
             }
         } else if (!strcmp(path, "/status")) {
-            uint64_t v = counter_read(&C);                /* identical call site */
-            char db[CNT_PATHLEN];
+            uint64_t v = sub_read(&C);                /* identical call site */
+            char db[SUB_PATHLEN];
             dbfile_now(db, sizeof db);
             snprintf(body, sizeof body, "count = %llu\nmode  = %s\ndb    = %s\n",
-                     (unsigned long long)v, counter_mode(&C), db);
+                     (unsigned long long)v, sub_mode(&C), db);
             reply(fd, "200 OK", "text/plain; charset=utf-8", body);
         } else {
             reply(fd, "404 Not Found", "text/plain; charset=utf-8", "no\n");

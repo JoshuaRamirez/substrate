@@ -12,19 +12,19 @@
  * the database. They share a variable.
  */
 #import <Cocoa/Cocoa.h>
-#include "counter.h"
+#include "substrate.h"
 
-static cnt_seg  *SEG   = NULL;     /* NULL when no owner is running */
-static cnt_peer *SELF  = NULL;
+static sub_seg  *SEG   = NULL;     /* NULL when no owner is running */
+static sub_peer *SELF  = NULL;
 static int       ATTACH_ERR = 1;
 
 #define ROW_H   34.0
 #define TOP_Y   116.0
 #define PAD     18.0
 
-static NSRect g_stop[CNT_MAX_PEERS];      /* hit boxes, rebuilt each frame */
-static pid_t  g_stop_pid[CNT_MAX_PEERS];
-static int    g_stop_slot[CNT_MAX_PEERS]; /* which row, so the click can re-check */
+static NSRect g_stop[SUB_MAX_PEERS];      /* hit boxes, rebuilt each frame */
+static pid_t  g_stop_pid[SUB_MAX_PEERS];
+static int    g_stop_slot[SUB_MAX_PEERS]; /* which row, so the click can re-check */
 static int    g_stop_n = 0;
 static NSRect g_move;                     /* the "move..." hit box */
 static int    g_move_on = 0;
@@ -59,13 +59,13 @@ static NSString *uptime_str(uint64_t since) {
 }
 
 - (void)attachIfNeeded {
-    if (SEG && !cnt_owner_alive(SEG)) {     /* the owner left; stop trusting the page */
-        munmap(SEG, sizeof(cnt_seg));
+    if (SEG && !sub_owner_alive(SEG)) {     /* the owner left; stop trusting the page */
+        munmap(SEG, sizeof(sub_seg));
         SEG = NULL; SELF = NULL; g_stop_n = 0;
     }
     if (SEG) return;
-    SEG = cnt_attach(&ATTACH_ERR);
-    if (SEG) SELF = cnt_claim_slot(SEG, "top", "dash");
+    SEG = sub_attach(&ATTACH_ERR);
+    if (SEG) SELF = sub_claim_slot(SEG, "top", "dash");
 }
 
 - (void)drawRect:(NSRect)dirty {
@@ -87,15 +87,15 @@ static NSString *uptime_str(uint64_t since) {
                               [NSColor colorWithCalibratedWhite:0.62 alpha:1.0] }];
 
     NSString *sub = SEG ? [NSString stringWithFormat:@"%s  format v%u  %d slots",
-                                    CNT_SHM_NAME, CNT_VERSION, CNT_MAX_PEERS]
+                                    SUB_SHM_NAME, SUB_VERSION, SUB_MAX_PEERS]
                         : @"no owner attached";
     [sub drawAtPoint:NSMakePoint(PAD, H - 54) withAttributes:[self mono:10 white:0.40]];
 
     /* ---- where the data actually goes ---- */
     g_move_on = 0;
     if (SEG) {
-        char db[CNT_PATHLEN];
-        NSString *dbs = cnt_path_read(SEG, db, sizeof db) && db[0]
+        char db[SUB_PATHLEN];
+        NSString *dbs = sub_path_read(SEG, db, sizeof db) && db[0]
                       ? [NSString stringWithUTF8String:db] : @"(unknown)";
         NSString *line = [NSString stringWithFormat:@"db  %@", elide(dbs, 58)];
         [line drawAtPoint:NSMakePoint(PAD, H - 74) withAttributes:[self mono:10 white:0.52]];
@@ -162,11 +162,11 @@ static NSString *uptime_str(uint64_t since) {
     /* ---- rows ---- */
     g_stop_n = 0;
     int shown = 0;
-    for (int i = 0; i < CNT_MAX_PEERS; i++) {
-        cnt_peer *p = &SEG->peers[i];
+    for (int i = 0; i < SUB_MAX_PEERS; i++) {
+        sub_peer *p = &SEG->peers[i];
         if (atomic_load(&p->state) != 1) continue;
 
-        int alive = cnt_peer_alive(p);
+        int alive = sub_peer_alive(p);
         CGFloat ry = y - 24 - shown * ROW_H;
         if (ry < 30) break;
 
@@ -231,20 +231,20 @@ static NSString *uptime_str(uint64_t since) {
  * old path back, and the row below reverts on its own. */
 - (void)moveDatabase {
     if (!SEG) return;
-    char cur[CNT_PATHLEN];
+    char cur[SUB_PATHLEN];
     NSSavePanel *sp = [NSSavePanel savePanel];
-    [sp setTitle:@"Move the counter database"];
+    [sp setTitle:@"Move the substrate database"];
     [sp setPrompt:@"Move"];
-    [sp setNameFieldStringValue:@"counter.db"];
-    if (cnt_path_read(SEG, cur, sizeof cur) && cur[0]) {
+    [sp setNameFieldStringValue:@"substrate.db"];
+    if (sub_path_read(SEG, cur, sizeof cur) && cur[0]) {
         NSString *c = [NSString stringWithUTF8String:cur];
         [sp setDirectoryURL:[NSURL fileURLWithPath:[c stringByDeletingLastPathComponent]]];
         [sp setNameFieldStringValue:[c lastPathComponent]];
     }
     if ([sp runModal] == NSModalResponseOK) {
-        int rc = cnt_path_write(SEG, [[[sp URL] path] UTF8String]);
+        int rc = sub_path_write(SEG, [[[sp URL] path] UTF8String]);
         g_note = rc == 0 ? nil
-               : [NSString stringWithFormat:@"refused: %s", cnt_path_error(rc)];
+               : [NSString stringWithFormat:@"refused: %s", sub_path_error(rc)];
     }
     [self setNeedsDisplay:YES];
 }
@@ -257,7 +257,7 @@ static NSString *uptime_str(uint64_t since) {
             /* The row could have been reaped between the frame that drew this
              * button and this click, and the OS recycles pids. Signal only if
              * the slot STILL holds the pid we drew. */
-            cnt_peer *p = SEG ? &SEG->peers[g_stop_slot[i]] : NULL;
+            sub_peer *p = SEG ? &SEG->peers[g_stop_slot[i]] : NULL;
             if (!p || atomic_load(&p->state) != 1 ||
                 (pid_t)atomic_load(&p->pid) != g_stop_pid[i]) {
                 [self setNeedsDisplay:YES];
@@ -280,20 +280,20 @@ int main(int argc, const char **argv) {
             /* Not a leak: anything that can run this can already map the
              * segment and write every value in it. This just spells the
              * credential out for a shell, which cannot map shm from a pipe. */
-            SEG = cnt_attach(&ATTACH_ERR);
+            SEG = sub_attach(&ATTACH_ERR);
             if (!SEG) { fprintf(stderr, "no owner\n"); return 2; }
             if (!SEG->admin[0]) { fprintf(stderr, "owner minted no token\n"); return 3; }
             printf("%s\n", SEG->admin);
             return 0;
         }
         if (!strcmp(argv[i], "--selftest")) {          /* same data path, no window */
-            SEG = cnt_attach(&ATTACH_ERR);
+            SEG = sub_attach(&ATTACH_ERR);
             if (!SEG) { printf("top selftest: no owner (err=%d)\n", ATTACH_ERR); return 2; }
             int live = 0;
-            for (int k = 0; k < CNT_MAX_PEERS; k++)
-                if (cnt_peer_alive(&SEG->peers[k])) live++;
-            char db[CNT_PATHLEN];
-            if (!cnt_path_read(SEG, db, sizeof db)) snprintf(db, sizeof db, "(unknown)");
+            for (int k = 0; k < SUB_MAX_PEERS; k++)
+                if (sub_peer_alive(&SEG->peers[k])) live++;
+            char db[SUB_PATHLEN];
+            if (!sub_path_read(SEG, db, sizeof db)) snprintf(db, sizeof db, "(unknown)");
             printf("top selftest: peers=%d count=%llu\n", live,
                    (unsigned long long)atomic_load(&SEG->count));
             printf("top selftest: db=%s\n", db);

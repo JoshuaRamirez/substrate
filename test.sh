@@ -19,7 +19,7 @@ waitport(){
 
 
 pkill -f 'bin/(dbd|webd)' 2>/dev/null
-rm -f counter.db; sleep 0.3
+rm -f substrate.db; sleep 0.3
 
 echo "1. each binary runs ALONE, self-contained"
 ./bin/webd --port $PORT >/dev/null 2>&1 &
@@ -61,11 +61,11 @@ check "count survived dbd restart" "$G" "gui selftest: mode=joined count=4"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 
 echo "5. the format is pinned, not the binary"
-grep -qE "CNT_VERSION +[0-9]+u" counter.h && ok "segment carries magic + version" \
+grep -qE "SUB_VERSION +[0-9]+u" substrate.h && ok "segment carries magic + version" \
                                    || bad "segment carries magic + version"
 
 echo "6. the registry: the dashboard reads shm, not ps"
-rm -f counter.db   # section 4 left a persisted count; start this one clean
+rm -f substrate.db   # section 4 left a persisted count; start this one clean
 ./bin/dbd >/tmp/dbd3.log 2>&1 & DP=$!; sleep 0.4
 ./bin/webd --join --port 8101 >/dev/null 2>&1 & W1=$!
 ./bin/webd --join --port 8102 >/dev/null 2>&1 & W2=$!; waitport 8102
@@ -83,10 +83,10 @@ kill $W1 2>/dev/null; wait $W1 2>/dev/null
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 
 echo "8. the database can be moved while everything is running -- admin only"
-rm -f counter.db /tmp/moved.db
+rm -f substrate.db /tmp/moved.db
 ./bin/dbd >/tmp/dbd4.log 2>&1 & DP=$!; sleep 0.4
 ./bin/webd --join --port 8103 >/dev/null 2>&1 & W3=$!; waitport 8103
-curl -s localhost:8103/bump >/dev/null            # -> 1, into ./counter.db
+curl -s localhost:8103/bump >/dev/null            # -> 1, into ./substrate.db
 sleep 0.3
 TOK=$(./bin/top --token)
 AUTH="X-Admin-Token: $TOK"
@@ -102,14 +102,14 @@ check "the ungated route is gone" "$(code 'localhost:8103/dbfile?path=%2Ftmp%2Fm
 check "nothing moved while unauthorized" "$(cat /tmp/moved.db 2>/dev/null)" ""
 
 D=$(curl -s localhost:8103/status | sed -n 3p | sed 's/.*= //')
-check "webd reports the db path" "$(basename "$D")" "counter.db"
+check "webd reports the db path" "$(basename "$D")" "substrate.db"
 check "POST with the token moves it" "$(okf "$MOVE")" '"ok":true'
 sleep 0.4
 check "the new file has the count" "$(cat /tmp/moved.db 2>/dev/null)" "1"
 curl -s localhost:8103/bump >/dev/null            # -> 2, into /tmp/moved.db
 sleep 0.4
 check "new bumps land in the new file" "$(cat /tmp/moved.db 2>/dev/null)" "2"
-check "the old file kept its last value" "$(cat counter.db 2>/dev/null)" "1"
+check "the old file kept its last value" "$(cat substrate.db 2>/dev/null)" "1"
 D=$(curl -s localhost:8103/status | sed -n 3p | sed 's/.*= //')
 check "the path is visible to peers" "$D" "/tmp/moved.db"
 check "a relative path is refused" \
@@ -126,13 +126,13 @@ kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 rm -f /tmp/moved.db
 
 echo "9. the persisted file is chosen at startup too"
-rm -f counter.db /tmp/start.db; echo 41 > /tmp/start.db
+rm -f substrate.db /tmp/start.db; echo 41 > /tmp/start.db
 ./bin/dbd /tmp/start.db >/tmp/dbd5.log 2>&1 & DP=$!; sleep 0.4
 G=$(./bin/gui --selftest --join 2>&1)
 check "dbd restored from an argv path" "$G" "gui selftest: mode=joined count=42"
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null; sleep 0.3
 check "and persisted back to it" "$(cat /tmp/start.db)" "42"
-check "without touching the default" "$(cat counter.db 2>/dev/null)" ""
+check "without touching the default" "$(cat substrate.db 2>/dev/null)" ""
 rm -f /tmp/start.db
 
 echo "10. the dashboard tolerates an absent owner"
@@ -140,7 +140,7 @@ echo "10. the dashboard tolerates an absent owner"
 check "top --selftest exits 2 with no dbd" "$?" "2"
 
 echo "11. the owner cannot be displaced, and peers survive its restart"
-rm -f counter.db
+rm -f substrate.db
 ./bin/dbd >/tmp/dbdA.log 2>&1 & DA=$!; sleep 0.5
 ./bin/dbd >/tmp/dbdB.log 2>&1; RC=$?
 check "a second dbd refuses to start" "$RC" "3"
@@ -167,7 +167,7 @@ kill $W5 2>/dev/null; wait $W5 2>/dev/null
 kill -TERM $DC 2>/dev/null; wait $DC 2>/dev/null
 
 echo "12. a killed writer cannot wedge the path"
-rm -f counter.db
+rm -f substrate.db
 ./bin/dbd >/tmp/dbdD.log 2>&1 & DD=$!; sleep 0.5
 ./bin/wedge >/dev/null 2>&1                          # takes path_seq odd, then dies
 sleep 0.6
@@ -183,15 +183,15 @@ kill -TERM $DD 2>/dev/null; wait $DD 2>/dev/null
 rm -f /tmp/after.db
 
 echo "13. persistence is crash-safe"
-rm -f counter.db counter.db.tmp
+rm -f substrate.db substrate.db.tmp
 ./bin/dbd >/tmp/dbdE.log 2>&1 & DE=$!; sleep 0.4
 ./bin/gui --selftest --join >/dev/null 2>&1; sleep 0.4
-check "no temp file is left behind" "$(ls counter.db.tmp 2>/dev/null)" ""
-check "the count is there in full" "$(cat counter.db)" "1"
+check "no temp file is left behind" "$(ls substrate.db.tmp 2>/dev/null)" ""
+check "the count is there in full" "$(cat substrate.db)" "1"
 kill -TERM $DE 2>/dev/null; wait $DE 2>/dev/null
 
 echo "14. reserve: the verb whose answer the caller waits for"
-rm -f counter.db
+rm -f substrate.db
 ./bin/webd --port 8140 >/dev/null 2>&1 & WA=$!; waitport 8140
 check "alone: first range starts at 1" \
       "$(curl -s 'localhost:8140/reserve?n=10' | sed -n 2p | tr -d ' ')" "base=1"
@@ -216,7 +216,7 @@ kill $W7 $W8 2>/dev/null; wait $W7 2>/dev/null; wait $W8 2>/dev/null
 kill -TERM $DF 2>/dev/null; wait $DF 2>/dev/null
 
 echo "15. the ring survives its callers"
-rm -f counter.db
+rm -f substrate.db
 ./bin/dbd >/tmp/dbdG.log 2>&1 & DG=$!; sleep 0.5
 ./bin/hog >/dev/null 2>&1                            # claims every slot, then dies
 sleep 0.6
@@ -240,7 +240,7 @@ check "a miss is a miss" "$(./bin/look nosuchkey 2>&1)" "miss"
 check "it reports a million records" \
       "$(./bin/look --stat | head -1 | tr -d ' ')" "records=1000000"
 
-rm -f counter.db
+rm -f substrate.db
 ./bin/webd --port 8145 >/dev/null 2>&1 & WC=$!; waitport 8145
 check "webd carries the same table, alone" \
       "$(curl -s 'localhost:8145/lookup?k=k000000042' | sed -n 3p | tr -d ' ')" "value=111486301962"
@@ -271,10 +271,10 @@ check "python knows OFF_COUNT" "$(grep -o 'OFF_COUNT, OFF_OWNER_PID, OFF_NEXT_ID
 check "swift knows OFF_RING"   "$(grep -o 'OFF_RING *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val ring)"
 check "swift knows OFF_PEERS"  "$(grep -o 'OFF_PEERS *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val peers)"
 cmagic=$(echo "$L" | awk '/^magic/{print $2; exit}')
-check "swift knows the magic"  "$(grep -o '0x434E543[0-9]' swiftpeer.swift | head -1)" "$cmagic"
-check "python knows the magic" "$(grep -o '0x434E543[0-9]' pypeer.py | head -1)" "$cmagic"
+check "swift knows the magic"  "$(grep -oE '0x[0-9A-Fa-f]{8}' swiftpeer.swift | head -1)" "$cmagic"
+check "python knows the magic" "$(grep -oE '0x[0-9A-Fa-f]{8}' pypeer.py | head -1)" "$cmagic"
 
-rm -f counter.db
+rm -f substrate.db
 ./bin/dbd >/tmp/dbdI.log 2>&1 & DI=$!; sleep 0.5
 ./bin/webd --join --port 8147 >/dev/null 2>&1 & WE=$!; waitport 8147
 curl -s localhost:8147/bump >/dev/null; curl -s localhost:8147/bump >/dev/null   # C: 2
@@ -288,7 +288,7 @@ kill $WE 2>/dev/null; wait $WE 2>/dev/null
 kill -TERM $DI 2>/dev/null; wait $DI 2>/dev/null
 
 echo "18. contention at scale, and backpressure that waits instead of losing"
-rm -f counter.db
+rm -f substrate.db
 ./bin/dbd >/tmp/dbdJ.log 2>&1 & DJ=$!; sleep 0.5
 for n in 8 64 128; do
   R=$(./bin/storm $n 500 2>/dev/null)
@@ -306,7 +306,7 @@ done
 kill -TERM $DJ 2>/dev/null; wait $DJ 2>/dev/null
 
 echo "19. payload transfer: bytes that cross the boundary without being copied"
-rm -f counter.db /tmp/pl.bin /tmp/pl.out
+rm -f substrate.db /tmp/pl.bin /tmp/pl.out
 ./bin/dbd >/tmp/dbdK.log 2>&1 & DK=$!; sleep 0.5
 ./bin/webd --join --port 8148 >/dev/null 2>&1 & WF=$!; waitport 8148
 head -c 900000 /dev/urandom > /tmp/pl.bin
@@ -346,7 +346,7 @@ else
     ./bin/storm 64 500 2>/dev/null | awk "/duplicates/{print \"DUP \" \$2} /gaps/{print \"GAP \" \$5} /dropped/{print \"DROP \" \$3} /joined/{print \"JOIN \" \$4}"
     useradd -m intruder 2>/dev/null
     su intruder -c "/src/bin/storm 1 1" >/dev/null 2>&1; echo "OTHERUSER $?"
-    stat -c "%a" /dev/shm/cnt.v7 | sed "s/^/MODE /"
+    stat -c "%a" /dev/shm/sub.v8 | sed "s/^/MODE /"
   ' 2>/dev/null)
   g(){ echo "$OUT" | awk -v k="$1" '$1==k{print $2}'; }
   check "linux computes the same segment size" "$(g SIZE)"  "$(./bin/layout | awk '/^size/{print $2}')"
@@ -360,6 +360,6 @@ else
   check "another user cannot join"             "$(g OTHERUSER)" "1"
 fi
 
-rm -f counter.db
+rm -f substrate.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

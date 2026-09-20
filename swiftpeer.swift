@@ -10,9 +10,9 @@
 import Darwin
 
 // ---- the contract (see: ./bin/layout) ----
-let SHM_NAME   = "/cnt.v7"
-let MAGIC:  UInt32 = 0x434E5437
-let VERSION: UInt32 = 7
+let SHM_NAME   = "/sub.v8"
+let MAGIC:  UInt32 = 0x53554238
+let VERSION: UInt32 = 8
 let SEG_SIZE = 67141632
 
 let OFF_MAGIC     = 0
