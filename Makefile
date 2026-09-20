@@ -27,7 +27,7 @@ UNAME := $(shell uname -s)
 
 WARN = -Wall -Wextra -Wshadow -Wpointer-arith -Wwrite-strings -Wformat=2 \
        -Wformat-security -Wvla -Wcast-qual -Wmissing-prototypes \
-       -Wstrict-prototypes
+       -Wstrict-prototypes -Werror=implicit-function-declaration
 HARD = -fstack-protector-strong -D_FORTIFY_SOURCE=2 -fno-common
 OPT  ?= -O2
 ALL_CFLAGS = $(OPT) $(WARN) $(HARD) -std=c11 $(CFLAGS)

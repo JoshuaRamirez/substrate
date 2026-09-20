@@ -30,8 +30,21 @@
  * HIDES the BSD extensions this code needs (INADDR_LOOPBACK, MAP_SHARED).
  * So ask only where asking helps, and keep the per-platform knowledge here
  * rather than in every build command. */
-#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
-#  define _POSIX_C_SOURCE 200809L
+#if !defined(__APPLE__)
+#  if !defined(_POSIX_C_SOURCE)
+#    define _POSIX_C_SOURCE 200809L
+#  endif
+/* And _POSIX_C_SOURCE alone is not enough, which cost a green CI run to
+ * learn. Asking glibc for POSIX 2008 *strictly* also switches OFF everything
+ * outside it -- and usleep() was deleted from POSIX in 2008, so unistd.h
+ * stops declaring it. _DEFAULT_SOURCE puts the BSD/misc set back.
+ *
+ * The failure was silent on clang 14 (implicit declaration: a warning, and
+ * the wrong prototype happened to work) and a hard error on clang 18. So a
+ * local container passed while the build was already broken. */
+#  if !defined(_DEFAULT_SOURCE)
+#    define _DEFAULT_SOURCE 1
+#  endif
 #endif
 
 #include <stdatomic.h>

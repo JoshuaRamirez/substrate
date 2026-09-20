@@ -1,18 +1,23 @@
-# Cross-OS check. Same sources, a different kernel and a different libc.
-FROM debian:bookworm-slim
-RUN apt-get update -qq && apt-get install -y -qq clang binutils curl >/dev/null
+# Cross-OS check. Same sources, same Makefile, a different kernel and libc.
+#
+# Two deliberate choices here, both learned the hard way:
+#
+# It runs `make`, it does not restate the compiler flags. This file used to
+# carry its own copy of them, and a copy is a place for the two to disagree
+# quietly about what is being tested.
+#
+# The base tracks a MODERN clang. Debian bookworm ships clang 14, which
+# treats an implicit function declaration as a warning -- so a missing
+# feature-test macro built fine here and was a hard error on CI's clang 18.
+# A cross-OS check on an older toolchain certifies the wrong thing.
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update -qq && \
+    apt-get install -y -qq clang binutils make curl python3 libatomic1 \
+    >/dev/null
 WORKDIR /src
-COPY substrate.h emdb.h dbd.c webd.c storm.c bench.c layout.c mkdb.c look.c wedge.c hog.c ./
-RUN set -e; \
-    mkdir -p bin; \
-    W="-Wall -Wextra -Wshadow -fstack-protector-strong -std=c11"; \
-    clang -O2 $W mkdb.c   -o bin/mkdb; \
-    ./bin/mkdb 200000 db.blob; \
-    ld -r -b binary -o db.o db.blob; \
-    clang -O2 $W dbd.c    -o bin/dbd; \
-    clang -O2 $W layout.c -o bin/layout; \
-    clang -O2 $W storm.c  -o bin/storm; \
-    clang -O2 $W bench.c  -o bin/bench; \
-    clang -O2 $W look.c   db.o -o bin/look; \
-    clang -O2 $W webd.c   db.o -o bin/webd
+COPY . /src
+# 200k rows, not a million: this image exists to check the FORMAT agrees
+# across libcs, and the row count is not part of the format.
+RUN make CC=clang EMDB_N=200000
 CMD ["/bin/bash"]
