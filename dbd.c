@@ -66,9 +66,72 @@ static void retarget(const char *want) {
     fflush(stdout);
 }
 
+/* Two operations an installer needs, before dbd becomes a server.
+ *
+ * Uninstalling has to be able to release the segment. The shm name outlives
+ * every process that ever mapped it, so deleting the binaries alone would
+ * leave /sub.v8 behind until the machine reboots, and the next install would
+ * inherit a stranger's page. */
+static int do_stop(void) {
+    int err = 0;
+    sub_seg *s = sub_attach(&err);
+    if (!s) { printf("dbd: no segment on %s\n", SUB_SHM_NAME); return 0; }
+    pid_t who = (pid_t)atomic_load(&s->owner_pid);
+    if (!sub_owner_alive(s)) {
+        munmap(s, sizeof *s);
+        printf("dbd: no live owner (last was pid %d)\n", (int)who);
+        return 0;
+    }
+    if (kill(who, SIGTERM) != 0) {
+        munmap(s, sizeof *s);
+        perror("dbd: kill");
+        return 1;
+    }
+    printf("dbd: SIGTERM -> owner pid %d, waiting\n", (int)who);
+    /* Let it leave on its own feet. Its own exit path is the only one that
+     * persists the count and unlinks the name; killing it harder loses both. */
+    int live = 1;
+    for (int i = 0; i < 100 && live; i++) {        /* up to 10s */
+        usleep(100000);
+        live = sub_owner_alive(s);
+    }
+    munmap(s, sizeof *s);
+    if (live) { fprintf(stderr, "dbd: owner pid %d did not exit\n", (int)who); return 1; }
+    printf("dbd: owner stopped\n");
+    return 0;
+}
+
+static int do_unlink(void) {
+    int err = 0;
+    sub_seg *s = sub_attach(&err);
+    if (s) {
+        int live = sub_owner_alive(s);
+        pid_t who = (pid_t)atomic_load(&s->owner_pid);
+        munmap(s, sizeof *s);
+        /* Unlinking removes the NAME, not the MAPPING. Doing it under a live
+         * owner is the split brain this project already paid for once: the
+         * owner and its peers keep using a page nobody can look up, and the
+         * next dbd creates a second world beside it. Refuse. */
+        if (live) {
+            fprintf(stderr, "dbd: refusing to unlink %s -- owner pid %d is alive "
+                            "(--stop it first)\n", SUB_SHM_NAME, (int)who);
+            return 3;
+        }
+    }
+    if (shm_unlink(SUB_SHM_NAME) == 0)  printf("dbd: unlinked %s\n", SUB_SHM_NAME);
+    else if (errno == ENOENT)           printf("dbd: %s already gone\n", SUB_SHM_NAME);
+    else { perror("dbd: shm_unlink"); return 1; }
+    return 0;
+}
+
 int main(int argc, char **argv) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
+
+    for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--stop"))   return do_stop();
+        if (!strcmp(argv[i], "--unlink")) return do_unlink();
+    }
 
     /* Where to persist: argv, then the environment, then the old default.
      * Resolved to absolute here, because the segment is read by processes
