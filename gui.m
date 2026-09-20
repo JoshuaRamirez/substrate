@@ -24,7 +24,10 @@ static NSRect BTN;
     [[NSColor colorWithCalibratedWhite:0.10 alpha:1.0] setFill];
     NSRectFill(b);
 
-    /* ---- every frame, straight off the shared page ---- */
+    /* ---- every frame: confirm the owner, then read straight off the page ----
+     * If dbd went away, counter_mode() turns "detached" and the title says so,
+     * rather than this window quietly showing a number nobody else shares. */
+    counter_revalidate(&C);
     uint64_t v = counter_read(&C);
 
     NSDictionary *big = @{
@@ -70,7 +73,11 @@ static NSRect BTN;
     }
 }
 
-- (void)tick:(NSTimer *)t { (void)t; [self setNeedsDisplay:YES]; }
+- (void)tick:(NSTimer *)t {
+    (void)t;
+    [[self window] setTitle:[NSString stringWithFormat:@"counter (%s)", counter_mode(&C)]];
+    [self setNeedsDisplay:YES];
+}
 
 @end
 

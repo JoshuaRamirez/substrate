@@ -28,11 +28,19 @@ static uint64_t load_persisted(void) {
     return (uint64_t)v;
 }
 
+/* Write, flush, fsync, then rename. A crash mid-write used to leave a
+ * truncated file that reads back as 0 -- silently losing the count it was
+ * supposed to protect. rename(2) is atomic on the same filesystem. */
 static int persist_to(const char *file, uint64_t v) {
-    FILE *f = fopen(file, "w");
+    char tmp[CNT_PATHLEN + 8];
+    if ((size_t)snprintf(tmp, sizeof tmp, "%s.tmp", file) >= sizeof tmp) return -1;
+    FILE *f = fopen(tmp, "w");
     if (!f) return -1;
-    fprintf(f, "%llu\n", (unsigned long long)v);
-    fclose(f);
+    if (fprintf(f, "%llu\n", (unsigned long long)v) < 0) { fclose(f); unlink(tmp); return -1; }
+    if (fflush(f) != 0)             { fclose(f); unlink(tmp); return -1; }
+    if (fsync(fileno(f)) != 0)      { fclose(f); unlink(tmp); return -1; }
+    if (fclose(f) != 0)             { unlink(tmp); return -1; }
+    if (rename(tmp, file) != 0)     { unlink(tmp); return -1; }
     return 0;
 }
 
@@ -75,10 +83,30 @@ int main(int argc, char **argv) {
 
     /* Clear any stale segment: on macOS an shm object can only be ftruncate'd
      * once in its life, so the owner must start from a fresh one. */
+    /* Never displace a live owner. Unlinking removes the NAME, not the MAPPING:
+     * a second dbd used to take the name while every existing peer kept using
+     * the old page, and the two worlds diverged in silence. Check first. */
+    {
+        int err = 0;
+        cnt_seg *existing = cnt_attach(&err);
+        if (existing) {
+            int live = cnt_owner_alive(existing);
+            pid_t who = (pid_t)atomic_load(&existing->owner_pid);
+            munmap(existing, sizeof *existing);
+            if (live) {
+                fprintf(stderr, "dbd: refusing to start -- owner already running "
+                                "on %s (pid %d)\n", CNT_SHM_NAME, who);
+                return 3;
+            }
+        }
+    }
     shm_unlink(CNT_SHM_NAME);
 
     int fd = shm_open(CNT_SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) { perror("shm_open"); return 1; }
+    /* No fchmod here: macOS rejects it on an shm descriptor (EINVAL), and it
+     * is not needed -- umask can only CLEAR permission bits, never add them,
+     * so 0600 cannot be widened into something group- or world-readable. */
     if (ftruncate(fd, sizeof(cnt_seg)) < 0) { perror("ftruncate"); return 1; }
 
     void *p = mmap(NULL, sizeof(cnt_seg), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
@@ -90,6 +118,8 @@ int main(int argc, char **argv) {
     atomic_store(&g_seg->count, start);
     atomic_store(&g_seg->path_seq, 0);
     cnt_path_write(g_seg, DBFILE);       /* publish where the data actually goes */
+    atomic_store(&g_seg->owner_pid, (uint64_t)getpid());
+    atomic_store(&g_seg->path_writer, 0);
     cnt_mint_admin(g_seg);        /* before magic: no peer sees a tokenless segment */
     g_seg->version = CNT_VERSION;
     g_seg->magic   = CNT_MAGIC;   /* magic last: peers see a valid segment or none */
@@ -106,6 +136,10 @@ int main(int argc, char **argv) {
 
     uint64_t last = (uint64_t)-1;
     while (!g_stop) {
+        if (cnt_seqlock_repair(g_seg)) {
+            printf("dbd: repaired a path seqlock left odd by a dead writer\n");
+            fflush(stdout);
+        }
         int reaped = cnt_reap(g_seg);
         if (reaped) { printf("dbd: reaped %d dead peer(s)\n", reaped); fflush(stdout); }
 

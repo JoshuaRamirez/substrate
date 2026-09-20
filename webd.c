@@ -158,6 +158,15 @@ static void dbfile_now(char *out, size_t cap) {
         snprintf(out, cap, "(none)");
 }
 
+/* write(2) may write less than asked; a partial header is a corrupt response. */
+static void writeall(int fd, const char *p, size_t n) {
+    while (n) {
+        ssize_t w = write(fd, p, n);
+        if (w <= 0) return;
+        p += w; n -= (size_t)w;
+    }
+}
+
 static void reply(int fd, const char *status, const char *ctype, const char *body) {
     char hdr[256];
     int n = snprintf(hdr, sizeof hdr,
@@ -166,8 +175,8 @@ static void reply(int fd, const char *status, const char *ctype, const char *bod
         "Content-Length: %zu\r\n"
         "Cache-Control: no-store\r\n"
         "Connection: close\r\n\r\n", status, ctype, strlen(body));
-    write(fd, hdr, n);
-    write(fd, body, strlen(body));
+    writeall(fd, hdr, (size_t)n);
+    writeall(fd, body, strlen(body));
 }
 
 /* The peer table, rendered for the browser. Same rows `top` draws. */
@@ -237,10 +246,30 @@ int main(int argc, char **argv) {
         int fd = accept(srv, NULL, NULL);
         if (fd < 0) continue;
 
-        char buf[2048];
-        ssize_t n = read(fd, buf, sizeof buf - 1);
-        if (n <= 0) { close(fd); continue; }
-        buf[n] = 0;
+        /* One read() could split the headers across TCP segments and drop the
+         * auth header on the floor -- which fails closed, but for the wrong
+         * reason. Read until the blank line, or give up with a real status. */
+        char buf[8192];
+        size_t have = 0;
+        int too_big = 0;
+        for (;;) {
+            if (have >= sizeof buf - 1) { too_big = 1; break; }
+            ssize_t n = read(fd, buf + have, sizeof buf - 1 - have);
+            if (n <= 0) break;
+            have += (size_t)n;
+            buf[have] = 0;
+            if (strstr(buf, "\r\n\r\n")) break;
+        }
+        if (too_big) {
+            reply(fd, "431 Request Header Fields Too Large",
+                  "text/plain; charset=utf-8", "too big\n");
+            close(fd); continue;
+        }
+        if (have == 0) { close(fd); continue; }
+        buf[have] = 0;
+
+        /* Did our owner go away, or come back? Cheap, once per request. */
+        counter_revalidate(&C);
 
         char method[8] = {0}, path[256] = {0};
         sscanf(buf, "%7s %255s", method, path);
@@ -254,9 +283,14 @@ int main(int argc, char **argv) {
             char tokj[CNT_TOKLEN + 8];
             snprintf(tokj, sizeof tokj, "'%s'", (C.seg && C.seg->admin[0]) ? C.seg->admin : "");
             const char *mark = strstr(PAGE, "%TOKEN%");
-            size_t pre = (size_t)(mark - PAGE);
-            snprintf(page, sizeof page, "%.*s%s%s", (int)pre, PAGE, tokj, mark + 7);
-            reply(fd, "200 OK", "text/html; charset=utf-8", page);
+            if (!mark) {                       /* template broken at build time */
+                reply(fd, "500 Internal Server Error",
+                      "text/plain; charset=utf-8", "page template missing %TOKEN%\n");
+            } else {
+                size_t pre = (size_t)(mark - PAGE);
+                snprintf(page, sizeof page, "%.*s%s%s", (int)pre, PAGE, tokj, mark + 7);
+                reply(fd, "200 OK", "text/html; charset=utf-8", page);
+            }
         } else if (!strcmp(path, "/api")) {
             json_state(body, sizeof body);
             reply(fd, "200 OK", "application/json", body);

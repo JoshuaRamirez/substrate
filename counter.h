@@ -32,11 +32,12 @@
 #include <signal.h>
 #include <time.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <errno.h>
 
-#define CNT_SHM_NAME  "/cnt.v4"      /* macOS caps shm names at 31 chars */
-#define CNT_MAGIC     0x434E5434u    /* "CNT4" */
-#define CNT_VERSION   4u             /* pin the FORMAT, not the binary */
+#define CNT_SHM_NAME  "/cnt.v5"      /* macOS caps shm names at 31 chars */
+#define CNT_MAGIC     0x434E5435u    /* "CNT5" */
+#define CNT_VERSION   5u             /* pin the FORMAT, not the binary */
 #define CNT_MAX_PEERS 16
 #define CNT_NAMELEN   16
 #define CNT_PATHLEN   256
@@ -57,7 +58,9 @@ typedef struct {
     uint32_t          magic;
     uint32_t          version;
     _Atomic uint64_t  count;
+    _Atomic uint64_t  owner_pid;           /* the one process that owns this page */
     _Atomic uint32_t  path_seq;            /* odd = a path write is in flight */
+    _Atomic uint64_t  path_writer;         /* pid holding path_seq odd, else 0 */
     char              path[CNT_PATHLEN];   /* absolute; the owner's database */
     char              admin[CNT_TOKLEN];   /* minted by the owner before `magic` */
     cnt_peer          peers[CNT_MAX_PEERS];
@@ -68,9 +71,12 @@ typedef struct {
     _Atomic uint64_t *ops;       /* <- and here. same trick, same pattern. */
     _Atomic uint64_t  own;       /* backing store when alone */
     _Atomic uint64_t  own_ops;
-    cnt_seg          *seg;       /* non-NULL only when joined */
-    cnt_peer         *slot;      /* this process's row, when joined */
-    int               joined;
+    cnt_seg          *seg;       /* non-NULL only when joined AND attached */
+    cnt_peer         *slot;      /* this process's row, when attached */
+    int               joined;    /* was --join asked for? */
+    int               detached;  /* asked to join, but the owner is gone */
+    char              name[CNT_NAMELEN];
+    char              role[CNT_NAMELEN];
 } counter;
 
 /* ---- the call sites. identical in both modes. ---- */
@@ -129,6 +135,61 @@ static inline int cnt_reap(cnt_seg *s) {
 }
 
 
+
+
+/* ---- the owner, and surviving its departure ---- */
+
+/* A segment is only as alive as the process that made it. When dbd exits it
+ * zeroes `magic`; when it is killed, `magic` survives but its pid does not.
+ * Check both, because shm_unlink removes the NAME, not the MAPPING -- a peer
+ * holding an unlinked page keeps it alive and would otherwise never find out
+ * the world had moved on. That was a real split-brain, not a hypothetical. */
+static inline int cnt_owner_alive(cnt_seg *s) {
+    if (!s || s->magic != CNT_MAGIC || s->version != CNT_VERSION) return 0;
+    pid_t p = (pid_t)atomic_load(&s->owner_pid);
+    return p > 0 && kill(p, 0) == 0;
+}
+
+/* Forward decls: revalidation needs both. */
+static inline cnt_seg *cnt_attach(int *err);
+static inline cnt_peer *cnt_claim_slot(cnt_seg *s, const char *name, const char *role);
+
+/* Call this from a loop, a request handler, or a frame. Returns 1 if this
+ * process is attached to a live owner, 0 if it is not.
+ *
+ * While detached, the counter keeps working against private memory so nothing
+ * crashes -- but counter_mode() says "detached", so no UI ever shows a shared
+ * number that is not shared. When an owner reappears, the private count is
+ * discarded: the owner's value is the truth, not ours. */
+static inline int counter_revalidate(counter *c) {
+    if (!c->joined) return 0;                       /* alone on purpose */
+
+    if (c->seg && cnt_owner_alive(c->seg)) return 1; /* the common case */
+
+    if (c->seg) {                                    /* the owner went away */
+        munmap(c->seg, sizeof(cnt_seg));
+        c->seg  = NULL;
+        c->slot = NULL;
+        c->cell = &c->own;
+        c->ops  = &c->own_ops;
+        c->detached = 1;
+    }
+
+    int err = 0;
+    cnt_seg *s = cnt_attach(&err);                   /* has a new owner appeared? */
+    if (!s) return 0;
+    if (!cnt_owner_alive(s)) { munmap(s, sizeof *s); return 0; }
+
+    cnt_peer *slot = cnt_claim_slot(s, c->name, c->role);
+    if (!slot) { munmap(s, sizeof *s); return 0; }
+
+    c->seg      = s;
+    c->slot     = slot;
+    c->cell     = &s->count;
+    c->ops      = &slot->ops;
+    c->detached = 0;
+    return 1;
+}
 
 /* ---- the admin credential ---- */
 
@@ -208,12 +269,30 @@ static inline int cnt_path_write(cnt_seg *s, const char *path) {
         if (a & 1) continue;
         if (!atomic_compare_exchange_weak_explicit(&s->path_seq, &a, a + 1,
                 memory_order_acquire, memory_order_relaxed)) continue;
+        atomic_store(&s->path_writer, (uint64_t)getpid());
         memset(s->path, 0, CNT_PATHLEN);
         memcpy(s->path, path, n);
+        atomic_store(&s->path_writer, 0);
         atomic_store_explicit(&s->path_seq, a + 2, memory_order_release);
         return 0;
     }
     return -3;
+}
+
+
+/* A writer killed between taking the sequence odd and putting it back even
+ * would wedge the path forever: every reader spins out, every writer spins
+ * out. Only the owner repairs it, and only once the writer is provably dead.
+ * Returns 1 if it repaired something. */
+static inline int cnt_seqlock_repair(cnt_seg *s) {
+    uint32_t a = atomic_load(&s->path_seq);
+    if (!(a & 1)) return 0;
+    pid_t w = (pid_t)atomic_load(&s->path_writer);
+    if (w > 0 && kill(w, 0) == 0) return 0;          /* still alive: mid-write */
+    s->path[CNT_PATHLEN - 1] = 0;                    /* bound any torn copy */
+    atomic_store(&s->path_writer, 0);
+    atomic_store_explicit(&s->path_seq, a + 1, memory_order_release);
+    return 1;
 }
 
 static inline const char *cnt_path_error(int rc) {
@@ -284,6 +363,8 @@ static inline int counter_open_joined(counter *c, const char *name, const char *
     c->cell   = &s->count;      /* <-- the entire difference between the modes */
     c->ops    = &slot->ops;
     c->joined = 1;
+    snprintf(c->name, sizeof c->name, "%s", name);
+    snprintf(c->role, sizeof c->role, "%s", role);
     return 0;
 }
 
@@ -298,7 +379,8 @@ static inline void counter_close(counter *c) {
 }
 
 static inline const char *counter_mode(counter *c) {
-    return c->joined ? "joined" : "alone";
+    if (!c->joined)  return "alone";
+    return c->detached ? "detached" : "joined";
 }
 
 #endif

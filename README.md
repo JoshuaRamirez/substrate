@@ -86,7 +86,7 @@ native dashboard needs no token.
 ## The admin layer
 
 **The trust boundary is the shm file mode, not a password.** Anything that can
-map `/cnt.v4` can already write every value in it, so peers are inside by
+map `/cnt.v5` can already write every value in it, so peers are inside by
 construction — `bin/top` moves the database with no token and no prompt. It
 does not ask permission, because asking would be theatre.
 
@@ -185,6 +185,39 @@ truth* of the cell, not each individual write. The moment an operation
 arrives that cannot be a single atomic, `dbd` becomes a real mediator and
 the ring buffer appears. That is the next increment, and it should be
 resisted until this one runs.
+
+## Hardening
+
+The prototype's early failures were all the same shape: **a shared name is not
+a shared lifetime.** `shm_unlink` removes the name, not the mapping, so a peer
+holding an unlinked page keeps it alive and never learns the world moved on.
+That was a real split brain, observed live, not a hypothesis.
+
+| Was | Now | Test |
+|---|---|---|
+| Restarting `dbd` silently orphaned every attached peer | Peers check the owner's pid, report `mode=detached`, and re-attach when an owner returns | 11 |
+| A second `dbd` took the name and forked the world | Refuses to start while a live owner holds it, and says whose pid | 11 |
+| A writer killed mid-seqlock wedged the path forever | The owner repairs the sequence once the writer is provably dead | 12 |
+| `persist()` could leave a truncated file reading back as `0` | Temp file → `fflush` → `fsync` → atomic `rename` | 13 |
+| One `read()` could split headers and drop the auth header | Reads to the blank line; `431` past 8 KB | — |
+| `write()` short-writes could emit a partial header | `writeall()` loops | — |
+| `top`'s stop button could signal a recycled pid | Re-checks the slot still holds that pid before `SIGTERM` | — |
+
+Built with `-Wall -Wextra -Wshadow -Wformat=2 -Wformat-security -Wcast-qual
+-Wvla -Wwrite-strings -fstack-protector-strong -D_FORTIFY_SOURCE=2`, clean.
+`./build.sh --san` builds the same sources under ASan + UBSan; the full suite
+passes there, and `webd` survives malformed request lines, header floods,
+5 KB tokens, embedded NULs and traversal attempts without a single sanitizer
+report.
+
+Two things checked and deliberately **not** changed:
+
+- **`fchmod` on the shm descriptor.** macOS returns `EINVAL`, and it was never
+  needed: `umask` can only clear permission bits, never add them, so `0600`
+  cannot widen into something group- or world-readable.
+- **An admin may write the database anywhere the owner can.** That is what
+  admin means. The gate is on *who* asks, not *where* they point it. A path
+  the owner cannot open is refused and reverted, so a bad path is inert.
 
 ## Falsification criteria — results
 

@@ -129,6 +129,57 @@ echo "10. the dashboard tolerates an absent owner"
 ./bin/top --selftest >/dev/null 2>&1
 check "top --selftest exits 2 with no dbd" "$?" "2"
 
+echo "11. the owner cannot be displaced, and peers survive its restart"
+rm -f counter.db
+./bin/dbd >/tmp/dbdA.log 2>&1 & DA=$!; sleep 0.5
+./bin/dbd >/tmp/dbdB.log 2>&1; RC=$?
+check "a second dbd refuses to start" "$RC" "3"
+grep -q "owner already running" /tmp/dbdB.log && ok "and says why" || bad "and says why"
+T=$(./bin/top --selftest 2>&1 | head -1)
+check "the first owner is untouched" "$T" "top selftest: peers=1 count=0"
+
+./bin/webd --join --port 8105 >/dev/null 2>&1 & W5=$!; sleep 0.5
+curl -s localhost:8105/bump >/dev/null; curl -s localhost:8105/bump >/dev/null
+M=$(curl -s localhost:8105/status | sed -n 2p | tr -d ' ')
+check "webd is joined" "$M" "mode=joined"
+
+kill -TERM $DA 2>/dev/null; wait $DA 2>/dev/null; sleep 0.5
+M=$(curl -s localhost:8105/status | sed -n 2p | tr -d ' ')
+check "webd notices the owner left" "$M" "mode=detached"
+
+./bin/dbd >/tmp/dbdC.log 2>&1 & DC=$!; sleep 0.7
+curl -s localhost:8105/status >/dev/null            # one request to revalidate
+M=$(curl -s localhost:8105/status | sed -n 2p | tr -d ' ')
+check "and re-attaches when one returns" "$M" "mode=joined"
+T=$(./bin/top --selftest 2>&1 | head -1)
+check "the new owner sees the old peer" "$T" "top selftest: peers=2 count=2"
+kill $W5 2>/dev/null; wait $W5 2>/dev/null
+kill -TERM $DC 2>/dev/null; wait $DC 2>/dev/null
+
+echo "12. a killed writer cannot wedge the path"
+rm -f counter.db
+./bin/dbd >/tmp/dbdD.log 2>&1 & DD=$!; sleep 0.5
+./bin/wedge >/dev/null 2>&1                          # takes path_seq odd, then dies
+sleep 0.6
+grep -q "repaired a path seqlock" /tmp/dbdD.log && ok "dbd repaired the seqlock" \
+                                                || bad "dbd repaired the seqlock"
+./bin/webd --join --port 8106 >/dev/null 2>&1 & W6=$!; sleep 0.5
+TOK=$(./bin/top --token)
+R=$(curl -s -X POST -H "X-Admin-Token: $TOK" \
+        "localhost:8106/admin/dbfile?path=%2Ftmp%2Fafter.db" | grep -o '"ok":[a-z]*')
+check "the path still works afterwards" "$R" '"ok":true'
+kill $W6 2>/dev/null; wait $W6 2>/dev/null
+kill -TERM $DD 2>/dev/null; wait $DD 2>/dev/null
+rm -f /tmp/after.db
+
+echo "13. persistence is crash-safe"
+rm -f counter.db counter.db.tmp
+./bin/dbd >/tmp/dbdE.log 2>&1 & DE=$!; sleep 0.4
+./bin/gui --selftest --join >/dev/null 2>&1; sleep 0.4
+check "no temp file is left behind" "$(ls counter.db.tmp 2>/dev/null)" ""
+check "the count is there in full" "$(cat counter.db)" "1"
+kill -TERM $DE 2>/dev/null; wait $DE 2>/dev/null
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

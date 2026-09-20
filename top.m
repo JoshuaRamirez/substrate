@@ -24,6 +24,7 @@ static int       ATTACH_ERR = 1;
 
 static NSRect g_stop[CNT_MAX_PEERS];      /* hit boxes, rebuilt each frame */
 static pid_t  g_stop_pid[CNT_MAX_PEERS];
+static int    g_stop_slot[CNT_MAX_PEERS]; /* which row, so the click can re-check */
 static int    g_stop_n = 0;
 static NSRect g_move;                     /* the "move..." hit box */
 static int    g_move_on = 0;
@@ -58,6 +59,10 @@ static NSString *uptime_str(uint64_t since) {
 }
 
 - (void)attachIfNeeded {
+    if (SEG && !cnt_owner_alive(SEG)) {     /* the owner left; stop trusting the page */
+        munmap(SEG, sizeof(cnt_seg));
+        SEG = NULL; SELF = NULL; g_stop_n = 0;
+    }
     if (SEG) return;
     SEG = cnt_attach(&ATTACH_ERR);
     if (SEG) SELF = cnt_claim_slot(SEG, "top", "dash");
@@ -203,8 +208,9 @@ static NSString *uptime_str(uint64_t since) {
             [@"stop" drawAtPoint:NSMakePoint(NSMidX(sb) - ss.width / 2,
                                              NSMidY(sb) - ss.height / 2)
                   withAttributes:sa];
-            g_stop[g_stop_n]     = sb;
-            g_stop_pid[g_stop_n] = pid;
+            g_stop[g_stop_n]      = sb;
+            g_stop_pid[g_stop_n]  = pid;
+            g_stop_slot[g_stop_n] = i;
             g_stop_n++;
         }
         shown++;
@@ -248,6 +254,15 @@ static NSString *uptime_str(uint64_t since) {
     if (g_move_on && NSPointInRect(pt, g_move)) { [self moveDatabase]; return; }
     for (int i = 0; i < g_stop_n; i++) {
         if (NSPointInRect(pt, g_stop[i])) {
+            /* The row could have been reaped between the frame that drew this
+             * button and this click, and the OS recycles pids. Signal only if
+             * the slot STILL holds the pid we drew. */
+            cnt_peer *p = SEG ? &SEG->peers[g_stop_slot[i]] : NULL;
+            if (!p || atomic_load(&p->state) != 1 ||
+                (pid_t)atomic_load(&p->pid) != g_stop_pid[i]) {
+                [self setNeedsDisplay:YES];
+                return;
+            }
             kill(g_stop_pid[i], SIGTERM);
             [self setNeedsDisplay:YES];
             return;
