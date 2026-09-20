@@ -3,16 +3,11 @@
  *
  * Peers mutate the count with an atomic and need no protocol to do so.
  * When the boundary is memory, some operations need no protocol at all.
- *
- * Where it persists is itself shared state. The path lives in the segment, so
- * any peer can move the database while everything is running: write the path,
- * and the owner picks it up on its next tick. Save As, not Open -- the count
- * keeps counting; only its destination changes.
  */
 #include "counter.h"
 #include <stdlib.h>
 
-static char      DBFILE[CNT_PATHLEN] = "counter.db";
+static const char *DBFILE = "counter.db";
 static cnt_seg  *g_seg  = NULL;
 static cnt_peer *g_self = NULL;
 static volatile sig_atomic_t g_stop = 0;
@@ -28,50 +23,16 @@ static uint64_t load_persisted(void) {
     return (uint64_t)v;
 }
 
-static int persist_to(const char *file, uint64_t v) {
-    FILE *f = fopen(file, "w");
-    if (!f) return -1;
+static void persist(uint64_t v) {
+    FILE *f = fopen(DBFILE, "w");
+    if (!f) { perror("persist"); return; }
     fprintf(f, "%llu\n", (unsigned long long)v);
     fclose(f);
-    return 0;
 }
 
-static void persist(uint64_t v) {
-    if (persist_to(DBFILE, v) < 0) perror("persist");
-}
-
-/* A peer asked for a different file. Prove the new one is writable BEFORE
- * committing to it: a refused move leaves the database exactly where it was,
- * and the segment is corrected so the dashboard never shows a lie. */
-static void retarget(const char *want) {
-    uint64_t now = atomic_load(&g_seg->count);
-    if (persist_to(want, now) < 0) {
-        printf("dbd: refused %s (%s) -- staying on %s\n",
-               want, strerror(errno), DBFILE);
-        cnt_path_write(g_seg, DBFILE);
-        fflush(stdout);
-        return;
-    }
-    persist(now);                                  /* flush the file we are leaving */
-    snprintf(DBFILE, sizeof DBFILE, "%s", want);
-    printf("dbd: database -> %s  (count=%llu)\n", DBFILE, (unsigned long long)now);
-    fflush(stdout);
-}
-
-int main(int argc, char **argv) {
+int main(void) {
     signal(SIGINT, on_signal);
     signal(SIGTERM, on_signal);
-
-    /* Where to persist: argv, then the environment, then the old default.
-     * Resolved to absolute here, because the segment is read by processes
-     * whose working directory is not ours. */
-    const char *want = NULL;
-    for (int i = 1; i < argc; i++) if (argv[i][0] != '-') { want = argv[i]; break; }
-    if (!want) want = getenv("COUNTER_DB");
-    if (!want) want = "counter.db";
-    char abs[CNT_PATHLEN];
-    cnt_abspath(want, abs, sizeof abs);
-    snprintf(DBFILE, sizeof DBFILE, "%s", abs);
 
     /* Clear any stale segment: on macOS an shm object can only be ftruncate'd
      * once in its life, so the owner must start from a fresh one. */
@@ -88,8 +49,6 @@ int main(int argc, char **argv) {
     g_seg = (cnt_seg *)p;
     uint64_t start = load_persisted();
     atomic_store(&g_seg->count, start);
-    atomic_store(&g_seg->path_seq, 0);
-    cnt_path_write(g_seg, DBFILE);       /* publish where the data actually goes */
     g_seg->version = CNT_VERSION;
     g_seg->magic   = CNT_MAGIC;   /* magic last: peers see a valid segment or none */
 
@@ -98,17 +57,12 @@ int main(int argc, char **argv) {
     printf("dbd: owning %s  (format v%u, %zu bytes, %d slots)  restored count=%llu\n",
            CNT_SHM_NAME, CNT_VERSION, sizeof(cnt_seg), CNT_MAX_PEERS,
            (unsigned long long)start);
-    printf("dbd: database %s\n", DBFILE);
     fflush(stdout);
 
     uint64_t last = (uint64_t)-1;
     while (!g_stop) {
         int reaped = cnt_reap(g_seg);
         if (reaped) { printf("dbd: reaped %d dead peer(s)\n", reaped); fflush(stdout); }
-
-        char asked[CNT_PATHLEN];
-        if (cnt_path_read(g_seg, asked, sizeof asked) && strcmp(asked, DBFILE) != 0)
-            retarget(asked);
 
         uint64_t now = atomic_load(&g_seg->count);
         if (now != last) {
@@ -126,7 +80,6 @@ int main(int argc, char **argv) {
     g_seg->magic = 0;              /* revoke: late joiners must not attach */
     munmap(g_seg, sizeof(cnt_seg));
     shm_unlink(CNT_SHM_NAME);
-    printf("\ndbd: stopped, persisted count=%llu to %s\n",
-           (unsigned long long)final, DBFILE);
+    printf("\ndbd: stopped, persisted count=%llu\n", (unsigned long long)final);
     return 0;
 }
