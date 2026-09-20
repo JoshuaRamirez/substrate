@@ -152,10 +152,11 @@ install: all
 	$(INSTALL) -m 644 substrate.h $(includedir)/substrate.h
 	@echo
 	@echo "installed into $(bindir):"
-	@ls $(bindir) | grep '^sub-' | sed 's/^/  /'
+	@ls $(bindir) | grep -E '^sub(-|$$)' | sed 's/^/  /'
 	@echo "  $(includedir)/substrate.h"
 	@echo
 	@echo "start it:  sub-dbd &  then  sub-webd --join"
+	@echo "use it:    sub run --name api -- your-server    then: sub ps"
 	@echo "stop it:   sub-dbd --stop"
 
 # Stop the owner without removing anything. Its own exit path is the only one
@@ -192,6 +193,10 @@ help:
 	@echo '  make test         build, then run the whole suite'
 	@echo '  make san          rebuild under ASan + UBSan'
 	@echo '  make run          the live demo: owner, web, gui, dashboard'
+	@echo
+	@echo '  sub run --name N -- cmd   run cmd and register it'
+	@echo '  sub ps                    list what is registered'
+	@echo '  sub stop NAME             stop one of them'
 	@echo
 	@echo '  make install      into $$(PREFIX), as sub-dbd, sub-webd, ...'
 	@echo '  make uninstall    stop the owner, release /sub.v8, remove the files'

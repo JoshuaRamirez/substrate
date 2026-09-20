@@ -36,9 +36,17 @@ jobs:
           done
           curl -sf localhost:8080/bump
           sub-pypeer --bump 2
+          # the process registry, driven entirely through installed binaries
+          ( sub run --name ci --role test -- sleep 60 >/dev/null 2>&1 & )
+          sleep 1
+          sub ps
+          sub ps | awk '$2=="ci"{f=1} END{exit !f}'
+          sub stop ci
+          sub ps | awk '$2=="ci"{exit 1}'
           make uninstall PREFIX="$HOME/.local"
           test ! -e "$HOME/.local/bin/sub-dbd"
           test ! -e "$HOME/.local/include/substrate.h"
+          test ! -e "$HOME/.local/bin/sub"
 
   linux:
     name: Linux (clang, glibc)
@@ -62,6 +70,7 @@ jobs:
           sub-layout
           make uninstall PREFIX="$HOME/.local"
           test ! -e "$HOME/.local/bin/sub-dbd"
+          test ! -e "$HOME/.local/bin/sub"
 
   sanitizers:
     name: ASan + UBSan (macOS)

@@ -9,7 +9,7 @@ The absolute minimal prototype of a common-process executable pipeline.
 
 ## The whole thing
 
-Seven single-file executables and one script. No package manager, no
+Eight single-file executables and one script. No package manager, no
 dependency tree, no third-party code. Each is one translation unit.
 
 | | |
@@ -68,7 +68,7 @@ make install                      # /usr/local, so: sudo make install
 make install PREFIX=~/.local      # or somewhere you own
 ```
 
-Everything lands under a `sub-` prefix — `sub-dbd`, `sub-webd`, `sub-gui`,
+One bare command, `sub`, plus everything else under a `sub-` prefix — `sub-dbd`, `sub-webd`, `sub-gui`,
 `sub-top`, `sub-look`, `sub-layout`, `sub-bench`, `sub-pypeer` — plus
 `substrate.h` into `include/`. The prefix is not tidiness: this repo builds
 programs called `top` and `look`, and **both of those are real commands
@@ -81,6 +81,60 @@ sub-dbd &            # the owner: creates /sub.v8, restores the count
 sub-webd --join      # a peer:    http://localhost:8080
 sub-dbd --stop       # ask the owner to leave; it persists on the way out
 ```
+
+## Use it for your own daemons
+
+The peer table was built so the dashboard could show which of *this*
+project's processes were on the page. It is, without a byte changed, a
+process registry: 256 rows of `{pid, name, role, since, ops}`, and a row is
+cleared the moment its pid stops answering `kill(pid, 0)`. Liveness is not a
+heartbeat anyone has to remember to send — it is the OS answering a question.
+
+The one thing missing was that nothing else on your machine is written in C,
+so nothing else can include `substrate.h` and claim a row. `sub run` closes
+that: it claims the row *on the child's behalf*.
+
+```sh
+sub-dbd &                                          # the registry
+
+sub run --name api --role http:8099 -- node server.js
+sub run --name worker --role queue   -- python3 worker.py
+sub ps
+sub stop api
+```
+
+```
+PID       NAME             ROLE             UP         OPS
+52992     dbd              owner            4m12s      0
+53059     api              http:8099        3m58s      0
+53060     worker           queue            2m01s      0
+
+3 registered
+```
+
+Three details that are easy to get backwards, and are tested:
+
+- **The row holds the child's pid, not the wrapper's.** So `sub ps` shows you
+  the pid you actually want to `kill`, and reaping tracks the service. Kill
+  the wrapper and the row survives, because the thing it names is still
+  running. Kill the service and the row goes, because the thing it names is
+  not.
+- **Nobody has to release a row.** A `SIGKILL`ed service never gets to clean
+  up, and is reaped anyway. That is what makes this work for processes that
+  never agreed to anything.
+- **`sub run` refuses when the registry is down.** A service you believe is
+  managed and is not is worse than one that would not start. `--anyway` runs
+  it unregistered, but you have to ask.
+
+Nothing here changes the format. `sub` reads and writes only fields v8 already
+had, which is why `pypeer.py` and `swiftpeer.swift` keep working without being
+told anything.
+
+**What it is not.** This is a registry, not a supervisor. It does not restart
+anything, collect logs, order startup, or survive a reboot. `sub run` stays in
+the foreground and exits with its child's exit code — which is exactly what
+`launchd` wants to supervise, so put `sub run` inside a plist rather than
+teaching it to daemonize.
 
 ## Uninstall it
 
@@ -459,11 +513,12 @@ Run `make test`.
 | Criterion | Result |
 |---|---|
 | `--join` needs different code above the call site | **not falsified** — only the constructor differs |
-| Native GUI forces a system-installed toolkit | **not falsified** — Cocoa is the OS; `bin/gui` is 53K |
+| Native GUI forces a system-installed toolkit | **not falsified** — Cocoa is the OS; `bin/gui` is 58K |
 | The binaries need a shared runtime or launcher to find each other | **not falsified** — one shm name, no discovery |
 | The shared cell needs a lock, and the lock needs a protocol | **not falsified** — see below |
 | A reply-carrying verb forces a ring, and the ring breaks the one-pointer property | **not falsified** — the ring exists, `sub_reserve` needs it, and the call site still does not change |
 | A second language cannot join without a C shim | **not falsified** — Swift and Python both join on the format alone |
+| Registering a process in the table means putting an agent inside it | **not falsified** — `sub run` claims the row on the child's behalf, and the OS answers liveness |
 
 The fourth one fired, and it is worth being exact about how.
 
@@ -504,15 +559,16 @@ three of them found bugs on the way. What is honestly left:
 ## Sizes
 
 ```
-bin/dbd          51K    the owner
-bin/gui          53K    a native Cocoa window
-bin/top          55K    the dashboard
+bin/dbd          77K    the owner
+bin/sub          34K    register, list and stop what you run
+bin/gui          58K    a native Cocoa window
+bin/top          78K    the dashboard
 bin/swiftpeer    57K    a second compiled toolchain
-bin/bench        34K
-bin/layout       33K    prints the contract
-bin/peer         33K    gui and top, minus the window, for machines without Cocoa
+bin/bench        55K
+bin/layout       55K    prints the contract
+bin/peer         55K    gui and top, minus the window, for machines without Cocoa
 bin/look         38M  \
-bin/webd         38M  /  these two carry the 1,000,000-record table inside them
+bin/webd         39M  /  these two carry the 1,000,000-record table inside them
 ```
 
 The 38 MB is the feature. Two processes running `bin/look` map the same
