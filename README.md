@@ -9,8 +9,8 @@ The absolute minimal prototype of a common-process executable pipeline.
 
 ## The whole thing
 
-Three single-file executables, no package manager, no dependency tree,
-no third-party code. Each is one translation unit.
+Seven single-file executables and one script. No package manager, no
+dependency tree, no third-party code. Each is one translation unit.
 
 | | |
 |---|---|
@@ -24,7 +24,8 @@ no third-party code. Each is one translation unit.
 | `bin/layout` | prints the binary contract the three languages agree on. |
 | `bin/bench` | the numbers, against AF_UNIX and TCP loopback. |
 
-They share one `u64` and a 16-slot peer table in one shared-memory page.
+They share one `u64`, a 256-row peer table and a 32-slot ring in one
+shared-memory segment.
 
 ## The dashboard
 
