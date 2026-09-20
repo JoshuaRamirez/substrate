@@ -6,6 +6,10 @@
  * alive. That is the whole implementation.
  *
  * Immediate mode: the frame loop is the subscription.
+ *
+ * It also shows where the owner persists, and can move it: the panel writes a
+ * path into the same page, and dbd acts on it. The dashboard does not talk to
+ * the database. They share a variable.
  */
 #import <Cocoa/Cocoa.h>
 #include "counter.h"
@@ -15,12 +19,23 @@ static cnt_peer *SELF  = NULL;
 static int       ATTACH_ERR = 1;
 
 #define ROW_H   34.0
-#define TOP_Y   96.0
+#define TOP_Y   116.0
 #define PAD     18.0
 
 static NSRect g_stop[CNT_MAX_PEERS];      /* hit boxes, rebuilt each frame */
 static pid_t  g_stop_pid[CNT_MAX_PEERS];
 static int    g_stop_n = 0;
+static NSRect g_move;                     /* the "move..." hit box */
+static int    g_move_on = 0;
+static NSString *g_note = nil;            /* last refusal, shown under the path */
+
+/* Long paths lose their middle, not their name. */
+static NSString *elide(NSString *s, NSUInteger cap) {
+    if ([s length] <= cap) return s;
+    NSUInteger head = cap / 3, tail = cap - head - 1;
+    return [NSString stringWithFormat:@"%@...%@",
+            [s substringToIndex:head], [s substringFromIndex:[s length] - tail]];
+}
 
 static NSString *uptime_str(uint64_t since) {
     if (!since) return @"-";
@@ -70,6 +85,37 @@ static NSString *uptime_str(uint64_t since) {
                                     CNT_SHM_NAME, CNT_VERSION, CNT_MAX_PEERS]
                         : @"no owner attached";
     [sub drawAtPoint:NSMakePoint(PAD, H - 54) withAttributes:[self mono:10 white:0.40]];
+
+    /* ---- where the data actually goes ---- */
+    g_move_on = 0;
+    if (SEG) {
+        char db[CNT_PATHLEN];
+        NSString *dbs = cnt_path_read(SEG, db, sizeof db) && db[0]
+                      ? [NSString stringWithUTF8String:db] : @"(unknown)";
+        NSString *line = [NSString stringWithFormat:@"db  %@", elide(dbs, 58)];
+        [line drawAtPoint:NSMakePoint(PAD, H - 74) withAttributes:[self mono:10 white:0.52]];
+
+        NSSize ls = [line sizeWithAttributes:[self mono:10 white:0.52]];
+        g_move = NSMakeRect(PAD + ls.width + 12, H - 78, 58, 19);
+        g_move_on = 1;
+        [[NSColor colorWithCalibratedWhite:0.19 alpha:1.0] setFill];
+        [[NSBezierPath bezierPathWithRoundedRect:g_move xRadius:5 yRadius:5] fill];
+        NSDictionary *ma = @{
+            NSFontAttributeName : [NSFont systemFontOfSize:10 weight:NSFontWeightMedium],
+            NSForegroundColorAttributeName :
+                [NSColor colorWithCalibratedWhite:0.72 alpha:1.0] };
+        NSSize ms2 = [@"move..." sizeWithAttributes:ma];
+        [@"move..." drawAtPoint:NSMakePoint(NSMidX(g_move) - ms2.width / 2,
+                                            NSMidY(g_move) - ms2.height / 2)
+                 withAttributes:ma];
+
+        if (g_note)
+            [g_note drawAtPoint:NSMakePoint(PAD, H - 90)
+                 withAttributes:@{ NSFontAttributeName :
+                       [NSFont monospacedSystemFontOfSize:9 weight:NSFontWeightRegular],
+                   NSForegroundColorAttributeName :
+                       [NSColor colorWithCalibratedRed:0.83 green:0.42 blue:0.42 alpha:1] }];
+    }
 
     if (SEG) {
         NSString *cnt = [NSString stringWithFormat:@"%llu",
@@ -174,8 +220,32 @@ static NSString *uptime_str(uint64_t since) {
     [ft drawAtPoint:NSMakePoint(PAD, 12) withAttributes:[self mono:9 white:0.28]];
 }
 
+/* The dashboard does not ask dbd to move. It writes the path and goes back to
+ * drawing; dbd notices within 100ms. If dbd cannot open the file it writes the
+ * old path back, and the row below reverts on its own. */
+- (void)moveDatabase {
+    if (!SEG) return;
+    char cur[CNT_PATHLEN];
+    NSSavePanel *sp = [NSSavePanel savePanel];
+    [sp setTitle:@"Move the counter database"];
+    [sp setPrompt:@"Move"];
+    [sp setNameFieldStringValue:@"counter.db"];
+    if (cnt_path_read(SEG, cur, sizeof cur) && cur[0]) {
+        NSString *c = [NSString stringWithUTF8String:cur];
+        [sp setDirectoryURL:[NSURL fileURLWithPath:[c stringByDeletingLastPathComponent]]];
+        [sp setNameFieldStringValue:[c lastPathComponent]];
+    }
+    if ([sp runModal] == NSModalResponseOK) {
+        int rc = cnt_path_write(SEG, [[[sp URL] path] UTF8String]);
+        g_note = rc == 0 ? nil
+               : [NSString stringWithFormat:@"refused: %s", cnt_path_error(rc)];
+    }
+    [self setNeedsDisplay:YES];
+}
+
 - (void)mouseDown:(NSEvent *)e {
     NSPoint pt = [self convertPoint:e.locationInWindow fromView:nil];
+    if (g_move_on && NSPointInRect(pt, g_move)) { [self moveDatabase]; return; }
     for (int i = 0; i < g_stop_n; i++) {
         if (NSPointInRect(pt, g_stop[i])) {
             kill(g_stop_pid[i], SIGTERM);
@@ -197,8 +267,11 @@ int main(int argc, const char **argv) {
             int live = 0;
             for (int k = 0; k < CNT_MAX_PEERS; k++)
                 if (cnt_peer_alive(&SEG->peers[k])) live++;
+            char db[CNT_PATHLEN];
+            if (!cnt_path_read(SEG, db, sizeof db)) snprintf(db, sizeof db, "(unknown)");
             printf("top selftest: peers=%d count=%llu\n", live,
                    (unsigned long long)atomic_load(&SEG->count));
+            printf("top selftest: db=%s\n", db);
             return 0;
         }
     }

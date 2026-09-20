@@ -14,7 +14,7 @@ no third-party code. Each is one translation unit.
 
 | | |
 |---|---|
-| `bin/dbd`  | the database. Owns the segment's creation, lifetime, persistence. |
+| `bin/dbd`  | the database. Owns the segment's creation, lifetime, persistence. Its file can be moved while it runs. |
 | `bin/webd` | an HTTP driver. ~110 lines of BSD sockets. |
 | `bin/gui`  | a native Cocoa window. Not a webview. No HTML. No toolkit to install. |
 | `bin/top`  | a native dashboard of every running peer. Docker Desktop, minus Docker. |
@@ -49,6 +49,49 @@ compare-exchange. That is the entire concurrency story.
 Then: `curl localhost:8080/bump` and watch the number change in the native
 window. No websocket. No polling endpoint. No serialization. The GUI never
 spoke to the web server, and neither of them spoke a protocol.
+
+## Moving the database, live
+
+Where `dbd` persists is not baked into `dbd`. It is **in the shared page**,
+so any peer can change it while everything is running:
+
+```sh
+./bin/dbd /path/to/my.db              # or: COUNTER_DB=/path/to/my.db ./bin/dbd
+curl "localhost:8080/dbfile?path=/tmp/other.db"   # move it, live
+```
+
+In `bin/top`, the database path sits under the header with a `move...`
+button next to it. In the web page there is a path field and a `move`
+button. Neither one sends a request to `dbd`. They write the path into the
+segment and go back to drawing; `dbd` picks it up on its next tick, within
+100 ms. **There is no request, no reply, and no one to be down.**
+
+The semantics are *Save As*, not *Open*: the count keeps counting, only its
+destination changes. The old file keeps its last value. A path that `dbd`
+cannot open is refused — `dbd` proves the file is writable before committing,
+and writes the old path back, so the dashboard reverts on its own and never
+shows a destination the data is not going to.
+
+Two rules fall out of the segment being shared:
+
+- **Absolute paths only.** Peers have different working directories, so a
+  relative path names a different file in each one.
+- **The path is seqlocked.** See below — it is the one value here that needs
+  a protocol.
+
+## The exception that proves the rule
+
+Everything else in the segment is either a single atomic (`count`) or a row
+whose only writer is the process that claimed it (the peer table). Neither
+needs a lock. The path is neither: it is 256 bytes, and any peer may write it.
+
+So it gets the smallest protocol that works — a **seqlock**. Writers take a
+sequence counter odd, copy, put it back even. Readers copy, then check the
+sequence did not move under them, and retry if it did. About twenty lines in
+`counter.h`, no mutex, no blocking, and readers never stall a writer.
+
+This is the same "publish last" shape `dbd` already used for `magic`,
+generalised from one word to a buffer.
 
 ## The mode switch is one pointer
 
@@ -116,10 +159,21 @@ Run `./test.sh`.
 | `--join` needs different code above the call site | **not falsified** — only the constructor differs |
 | Native GUI forces a system-installed toolkit | **not falsified** — Cocoa is the OS; `bin/gui` is 53K |
 | The binaries need a shared runtime or launcher to find each other | **not falsified** — one shm name, no discovery |
-| The shared cell needs a lock, and the lock needs a protocol | **not falsified at one verb** — watch this one |
+| The shared cell needs a lock, and the lock needs a protocol | **not falsified for the cell** — but see below |
 
-The fourth is the one to watch. If a second verb makes it fire, the honest
-conclusion is that the ring buffer was load-bearing from the start.
+The fourth one fired, and it is worth being exact about how.
+
+A second verb arrived: *move the database*. It did **not** need a lock for
+the count, and it did **not** summon the ring buffer. But its payload is a
+256-byte path rather than one word, and it has many writers, so it needed a
+seqlock — twenty lines, no mutex, no blocking.
+
+So the honest reading is narrower than the criterion was written. It is not
+that shared memory needs no protocol. It is that **a protocol is needed per
+shape of value, not per system.** A word-sized value with one writer needs
+nothing. A buffer with many writers needs publication ordering, and that is
+cheap. The ring buffer becomes load-bearing at a third thing: an operation
+whose *result* other peers must wait on. Nothing here does yet.
 
 ## What this deliberately does not prove
 
@@ -130,8 +184,8 @@ contention, crash recovery, cross-language ABI. All of those arrive with
 ## Sizes
 
 ```
-bin/dbd    34K
+bin/dbd    50K
 bin/webd   34K
 bin/gui    53K
-bin/top    54K
+bin/top    55K
 ```
