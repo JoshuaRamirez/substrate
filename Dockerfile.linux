@@ -1,0 +1,18 @@
+# Cross-OS check. Same sources, a different kernel and a different libc.
+FROM debian:bookworm-slim
+RUN apt-get update -qq && apt-get install -y -qq clang binutils curl >/dev/null
+WORKDIR /src
+COPY counter.h emdb.h dbd.c webd.c storm.c bench.c layout.c mkdb.c look.c wedge.c hog.c ./
+RUN set -e; \
+    mkdir -p bin; \
+    W="-Wall -Wextra -Wshadow -fstack-protector-strong -std=c11"; \
+    clang -O2 $W mkdb.c   -o bin/mkdb; \
+    ./bin/mkdb 200000 db.blob; \
+    ld -r -b binary -o db.o db.blob; \
+    clang -O2 $W dbd.c    -o bin/dbd; \
+    clang -O2 $W layout.c -o bin/layout; \
+    clang -O2 $W storm.c  -o bin/storm; \
+    clang -O2 $W bench.c  -o bin/bench; \
+    clang -O2 $W look.c   db.o -o bin/look; \
+    clang -O2 $W webd.c   db.o -o bin/webd
+CMD ["/bin/bash"]

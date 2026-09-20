@@ -25,11 +25,30 @@
 #ifndef EMDB_H
 #define EMDB_H
 
+/* Feature macros, and they pull in OPPOSITE directions.
+ *
+ * glibc hides clock_gettime and shm_open under strict -std=c11 unless asked
+ * for POSIX 2008. Apple's libc does the reverse: defining _POSIX_C_SOURCE
+ * HIDES the BSD extensions this code needs (INADDR_LOOPBACK, MAP_SHARED).
+ * So ask only where asking helps, and keep the per-platform knowledge here
+ * rather than in every build command. */
+#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-#include <mach-o/getsect.h>
-#include <mach-o/ldsyms.h>
+#if defined(__APPLE__)
+#  include <mach-o/getsect.h>
+#  include <mach-o/ldsyms.h>
+#else
+/* ELF: `ld -r -b binary` turns a file into an object and names its bounds.
+ * Different linker, same idea -- the data is a read-only, file-backed part of
+ * the image, mapped at exec and shared between instances by the page cache. */
+extern const uint8_t _binary_db_blob_start[];
+extern const uint8_t _binary_db_blob_end[];
+#endif
 
 #define EMDB_KEYLEN 32
 
@@ -47,7 +66,13 @@ typedef struct {
 /* No I/O happens here. The section is already mapped; this just finds it. */
 static inline int emdb_open(emdb *db) {
     unsigned long sz = 0;
-    const uint8_t *p = getsectiondata(&_mh_execute_header, "__TEXT", "__emdb", &sz);
+    const uint8_t *p;
+#if defined(__APPLE__)
+    p = getsectiondata(&_mh_execute_header, "__TEXT", "__emdb", &sz);
+#else
+    p  = _binary_db_blob_start;
+    sz = (unsigned long)(_binary_db_blob_end - _binary_db_blob_start);
+#endif
     if (!p || sz < sizeof(emdb_rec)) { db->rec = NULL; db->count = 0; db->bytes = 0; return -1; }
     db->rec   = (const emdb_rec *)(const void *)p;
     db->count = sz / sizeof(emdb_rec);

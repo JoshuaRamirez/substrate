@@ -23,6 +23,17 @@
 #ifndef COUNTER_H
 #define COUNTER_H
 
+/* Feature macros, and they pull in OPPOSITE directions.
+ *
+ * glibc hides clock_gettime and shm_open under strict -std=c11 unless asked
+ * for POSIX 2008. Apple's libc does the reverse: defining _POSIX_C_SOURCE
+ * HIDES the BSD extensions this code needs (INADDR_LOOPBACK, MAP_SHARED).
+ * So ask only where asking helps, and keep the per-platform knowledge here
+ * rather than in every build command. */
+#if !defined(__APPLE__) && !defined(_POSIX_C_SOURCE)
+#  define _POSIX_C_SOURCE 200809L
+#endif
+
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>

@@ -334,6 +334,32 @@ kill $WF 2>/dev/null; wait $WF 2>/dev/null
 kill -TERM $DK 2>/dev/null; wait $DK 2>/dev/null
 rm -f /tmp/pl.bin /tmp/pl.out
 
+echo "20. another OS, another libc, and another user"
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  echo "  SKIP  docker not available (cross-OS checks not run)"
+else
+  docker build -q -f Dockerfile.linux -t cntpipe:linux . >/dev/null 2>&1
+  OUT=$(docker run --rm cntpipe:linux bash -c '
+    ./bin/layout | awk "/^size/{print \"SIZE \" \$2} /^magic/ && !m {print \"MAGIC \" \$2; m=1}"
+    ./bin/dbd >/dev/null 2>&1 & sleep 1
+    echo "LOOK $(./bin/look k000000042)"
+    ./bin/storm 64 500 2>/dev/null | awk "/duplicates/{print \"DUP \" \$2} /gaps/{print \"GAP \" \$5} /dropped/{print \"DROP \" \$3} /joined/{print \"JOIN \" \$4}"
+    useradd -m intruder 2>/dev/null
+    su intruder -c "/src/bin/storm 1 1" >/dev/null 2>&1; echo "OTHERUSER $?"
+    stat -c "%a" /dev/shm/cnt.v7 | sed "s/^/MODE /"
+  ' 2>/dev/null)
+  g(){ echo "$OUT" | awk -v k="$1" '$1==k{print $2}'; }
+  check "linux computes the same segment size" "$(g SIZE)"  "$(./bin/layout | awk '/^size/{print $2}')"
+  check "linux computes the same magic"        "$(g MAGIC)" "$(./bin/layout | awk '/^magic/{print $2; exit}')"
+  check "the embedded table reads the same via ELF" "$(g LOOK)" "111486301962"
+  check "64 clients on linux: all joined"      "$(g JOIN)" "64"
+  check "64 clients on linux: no duplicates"   "$(g DUP)"  "0"
+  check "64 clients on linux: no lost ids"     "$(g GAP)"  "0"
+  check "64 clients on linux: nothing dropped" "$(g DROP)" "0"
+  check "the segment is owner-only"            "$(g MODE)" "600"
+  check "another user cannot join"             "$(g OTHERUSER)" "1"
+fi
+
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

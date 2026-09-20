@@ -91,7 +91,7 @@ native dashboard needs no token.
 ## The admin layer
 
 **The trust boundary is the shm file mode, not a password.** Anything that can
-map `/cnt.v6` can already write every value in it, so peers are inside by
+map `/cnt.v7` can already write every value in it, so peers are inside by
 construction — `bin/top` moves the database with no token and no prompt. It
 does not ask permission, because asking would be theatre.
 
@@ -271,6 +271,97 @@ Two defects found *by measuring*, both fixed:
   1.7 *seconds*, and housekeeping fell 17× behind. The same mistake was in the
   client's timeout. Both are measured on a clock now.
 
+## Payloads: bytes that cross without being copied
+
+The ring carries words. A payload goes in the **arena** — 64 blocks of 1 MB in
+the segment — and what crosses the boundary is a *descriptor*: block index plus
+length. A reader is handed an offset into a page it already has mapped.
+
+`webd` streams a `PUT` body **straight into an arena block** — kernel to shared
+page, never landing in a local buffer — then publishes. 900 KB round-trips
+byte-identical, and `pypeer.py` reads the same blob out of the arena with a
+matching SHA: cross-language zero-copy.
+
+`./bin/blobbench --join`, versus AF_UNIX moving the same bytes:
+
+| payload | reader touches every byte | reader probes 1 B per page |
+|---|---|---|
+| 4 KB | 4.8× | 6.7× |
+| 64 KB | 2.1× | 11.8× |
+| 1 MB | **0.9×** | **37.3×** |
+
+**At 1 MB with a full read the arena is slower than the socket.** Both are
+memory-bandwidth bound on the read by then, and zero-copy buys nothing if you
+were going to touch every byte anyway. That is the honest ceiling, and quoting
+the 4 KB number without it would be a lie by selection.
+
+The structural difference is in the sparse column, and it *grows* with size:
+**with the arena you pay for what you read; with a socket you pay for what was
+sent.**
+
+## Contention, and backpressure that waits instead of losing
+
+`bin/storm` forks N clients onto the 32-slot ring and verifies the ids they
+receive form an exact `1..N` cover — no duplicate, no gap. M4 Max, 16 cores:
+
+| clients | throughput | dup | gap | dropped |
+|---|---|---|---|---|
+| 8 | 1,154 k/s | 0 | 0 | 0 |
+| 32 | 1,905 k/s | 0 | 0 | 0 |
+| 64 | 383 k/s | 0 | 0 | 0 |
+| 256 | 46 k/s | 0 | 0 | 0 |
+
+Throughput peaks at the ring width and degrades gracefully past it. Nothing is
+ever lost — that is the difference between a full queue and a failure.
+
+Contention did not just slow this design down, **it found three correctness
+bugs**, every one invisible below the core count:
+
+1. **The registry was the limit, not the ring.** The peer table capped at 16,
+   so a "64 client" test silently ran 21 and passed.
+2. **Spinning starved the owner.** 64 spinning clients on 16 cores took
+   throughput from 2.3 M/s to 16 k/s and *dropped* 32 requests. Waiting is now
+   spin → `sched_yield` → `usleep`; the yield is the load-bearing step.
+3. **Two ways an id could be spent and reach nobody.** A timing-out client
+   could reclaim a slot the owner was mid-serve on (3,703 leaked per 128,000),
+   and the claim published `REQUEST` before writing its arguments, so the owner
+   could read the *previous* caller's (784 leaked). Fixed with a `SERVING`
+   state and a `CLAIMED` state — publish the state **last**, the same rule
+   `dbd` already used for `magic`.
+
+## Another OS, another libc, another user
+
+`Dockerfile.linux` builds the same sources under Debian, glibc 2.36, Linux
+aarch64 — a different kernel, a different libc, a different linker. The
+embedded table moves from a Mach-O `__TEXT` section to an ELF
+`ld -r -b binary` object; same idea, same page-cache sharing.
+
+| | macOS / Apple libc | Linux / glibc 2.36 |
+|---|---|---|
+| segment size | 67,141,632 | **67,141,632** |
+| magic | `0x434E5437` | `0x434E5437` |
+| `look k000000042` | 111486301962 | 111486301962 |
+| 64-client storm | 0 dup / 0 gap / 0 drop | 0 dup / 0 gap / 0 drop |
+| ring vs AF_UNIX | 7–10× | **36×** |
+
+The struct is byte-identical across two compilers and two libcs, which is the
+whole ABI claim in one number.
+
+Feature macros pull in *opposite* directions and the header now knows it:
+glibc hides `clock_gettime` under strict `-std=c11` unless you ask for POSIX
+2008; Apple's libc **hides the BSD extensions** if you do ask.
+
+**Another user cannot join.** `/dev/shm/cnt.v7` is mode `600`, and a second uid
+on the same machine gets "no owner" and exits non-zero. The trust boundary is
+not a convention — the kernel enforces it.
+
+## Another machine
+
+Not a gap: a *boundary*. Shared memory is single-machine by construction, and
+no amount of work here changes that. `webd` already **is** the bridge, and the
+cost of crossing it is measured above: TCP loopback is 30–50 µs against the
+ring's 0.5–2 µs, so anything remote pays roughly 30× before it leaves the box.
+
 ## Hardening
 
 The prototype's early failures were all the same shape: **a shared name is not
@@ -333,19 +424,17 @@ whose *result* other peers must wait on. Nothing here does yet.
 
 ## What this still does not prove
 
-The list has shrunk. Request/response latency, crash recovery and the
-cross-language ABI were all open and are now measured, tested and running.
-What is left:
+Payload transfer, backpressure, contention at scale, the second OS and the
+second user were all on this list. Each is now built, measured and tested, and
+three of them found bugs on the way. What is honestly left:
 
-- **Payload transfer.** Every value crossing the boundary is small and fixed
-  size. Nothing here hands over a buffer, so the arena and descriptor half of
-  the original design is untouched.
-- **Backpressure.** The ring has 32 slots and returns 0 when full. There is no
-  queueing, no fairness and no flow control.
-- **More than one machine, one user, one OS.** All of this is macOS, loopback,
-  a single uid, and the trust boundary is the shm file mode.
-- **Contention at scale.** Benchmarks are one client at a time. Nothing here
-  says what 16 peers hammering 32 slots does.
+- **Fairness.** No client starves in practice, but nothing *guarantees* it.
+  Slot claiming is a scan from index 0, so it is biased, not queued.
+- **Mixed-version coexistence.** v6 and v7 flatly refuse each other. Peers
+  built at different times cannot share a substrate at all.
+- **Capability partitioning.** Anything that can map the segment can write
+  every byte of it. The boundary is a file mode, not per-region permissions.
+- **More than one machine.** Not a gap — a boundary. See above.
 
 ## Sizes
 
