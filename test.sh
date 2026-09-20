@@ -14,9 +14,9 @@ echo "1. each binary runs ALONE, self-contained"
 ./bin/webd --port $PORT >/dev/null 2>&1 &
 WP=$!; sleep 0.4
 curl -s localhost:$PORT/bump >/dev/null; curl -s localhost:$PORT/bump >/dev/null
-R=$(curl -s localhost:$PORT/ | head -1 | tr -d ' ')
+R=$(curl -s localhost:$PORT/status | head -1 | tr -d ' ')
 check "webd alone counts" "$R" "count=2"
-M=$(curl -s localhost:$PORT/ | sed -n 2p | tr -d ' ')
+M=$(curl -s localhost:$PORT/status | sed -n 2p | tr -d ' ')
 check "webd alone reports mode" "$M" "mode=alone"
 kill $WP 2>/dev/null; wait $WP 2>/dev/null
 
@@ -34,9 +34,9 @@ curl -s localhost:$PORT/bump >/dev/null      # webd writes  -> 1
 curl -s localhost:$PORT/bump >/dev/null      # webd writes  -> 2
 G=$(./bin/gui --selftest --join 2>&1)        # gui writes   -> 3
 check "gui sees webd's writes" "$G" "gui selftest: mode=joined count=3"
-R=$(curl -s localhost:$PORT/ | head -1 | tr -d ' ')
+R=$(curl -s localhost:$PORT/status | head -1 | tr -d ' ')
 check "webd sees gui's write" "$R" "count=3"
-M=$(curl -s localhost:$PORT/ | sed -n 2p | tr -d ' ')
+M=$(curl -s localhost:$PORT/status | sed -n 2p | tr -d ' ')
 check "webd reports joined" "$M" "mode=joined"
 sleep 0.4
 grep -q "count=3" /tmp/dbd.log && ok "dbd observed count=3" || bad "dbd observed count=3"
