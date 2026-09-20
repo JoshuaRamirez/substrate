@@ -13,13 +13,16 @@ would be a process that *looks* joined and silently corrupts the ring.
 import ctypes, os, sys, time
 
 # ---- the contract (see: ./bin/layout) ----
-SHM_NAME, MAGIC, VERSION, SEG_SIZE = b"/cnt.v6", 0x434E5436, 6, 2648
+SHM_NAME, MAGIC, VERSION, SEG_SIZE = b"/cnt.v7", 0x434E5437, 7, 67141632
 OFF_COUNT, OFF_OWNER_PID, OFF_NEXT_ID = 8, 16, 336
-OFF_RING, OFF_PEERS = 344, 1624
-SLOT_SIZE, SLOT_N = 40, 32
-SLOT_STATE, SLOT_CLIENT, SLOT_ARG, SLOT_RESULT, SLOT_ERR = 0, 8, 16, 24, 32
+OFF_RING, OFF_PEERS = 7008, 8800
+OFF_ARENA, BLOCK_SIZE = 32768, 1048576
+SLOT_SIZE, SLOT_N = 56, 32
+SLOT_STATE, SLOT_OP, SLOT_CLIENT, SLOT_ARG = 0, 4, 8, 16
+SLOT_RESULT, SLOT_LEN, SLOT_BLOCK, SLOT_ERR = 24, 32, 40, 48
+OP_RESERVE, OP_PUT, OP_GET = 0, 1, 2
 FREE, REQUEST, DONE = 0, 1, 2
-PEER_SIZE, PEER_N = 64, 16
+PEER_SIZE, PEER_N = 64, 256
 PEER_STATE, PEER_PID, PEER_OPS, PEER_SINCE, PEER_NAME, PEER_ROLE = 0, 8, 16, 24, 32, 48
 NAMELEN = 16
 
@@ -124,6 +127,7 @@ def reserve(s, n, timeout=2.0):
         return 0
     b = OFF_RING + mine * SLOT_SIZE
     s.set64(b + SLOT_CLIENT, os.getpid())
+    s.set32(b + SLOT_OP, OP_RESERVE)
     s.set64(b + SLOT_ARG, n)
     s.set32(b + SLOT_ERR, 0)
     s.set32(b + SLOT_STATE, REQUEST)

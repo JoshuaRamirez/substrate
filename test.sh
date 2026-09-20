@@ -270,8 +270,9 @@ check "swift knows OFF_COUNT"  "$(grep -o 'OFF_COUNT *= *[0-9]*' swiftpeer.swift
 check "python knows OFF_COUNT" "$(grep -o 'OFF_COUNT, OFF_OWNER_PID, OFF_NEXT_ID = [0-9]*' pypeer.py | grep -o '[0-9]*$')" "$(val count)"
 check "swift knows OFF_RING"   "$(grep -o 'OFF_RING *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val ring)"
 check "swift knows OFF_PEERS"  "$(grep -o 'OFF_PEERS *= *[0-9]*' swiftpeer.swift | grep -o '[0-9]*$')" "$(val peers)"
-check "swift knows the magic"  "$(grep -o '0x434E543[0-9]' swiftpeer.swift | head -1)" "0x434E5436"
-check "python knows the magic" "$(grep -o '0x434E543[0-9]' pypeer.py | head -1)" "0x434E5436"
+cmagic=$(echo "$L" | awk '/^magic/{print $2; exit}')
+check "swift knows the magic"  "$(grep -o '0x434E543[0-9]' swiftpeer.swift | head -1)" "$cmagic"
+check "python knows the magic" "$(grep -o '0x434E543[0-9]' pypeer.py | head -1)" "$cmagic"
 
 rm -f counter.db
 ./bin/dbd >/tmp/dbdI.log 2>&1 & DI=$!; sleep 0.5
@@ -285,6 +286,24 @@ check "python can use the ring" "$(./pypeer.py --bump 0 --reserve 5 | sed -n 2p)
 check "C continues the same id space" "$(curl -s 'localhost:8147/reserve?n=2' | sed -n 2p | tr -d ' ')" "base=11"
 kill $WE 2>/dev/null; wait $WE 2>/dev/null
 kill -TERM $DI 2>/dev/null; wait $DI 2>/dev/null
+
+echo "18. contention at scale, and backpressure that waits instead of losing"
+rm -f counter.db
+./bin/dbd >/tmp/dbdJ.log 2>&1 & DJ=$!; sleep 0.5
+for n in 8 64 128; do
+  R=$(./bin/storm $n 500 2>/dev/null)
+  E=$?
+  j=$(echo "$R" | awk '/joined/{print $4}')
+  d=$(echo "$R" | awk '/duplicates/{print $2}')
+  g=$(echo "$R" | awk '/gaps/{print $5}')
+  p=$(echo "$R" | awk '/dropped/{print $3}')
+  check "$n clients all joined"        "$j" "$n"
+  check "$n clients: no duplicate ids" "$d" "0"
+  check "$n clients: no lost ids"      "$g" "0"
+  check "$n clients: nothing dropped"  "$p" "0"
+  check "$n clients: exit clean"       "$E" "0"
+done
+kill -TERM $DJ 2>/dev/null; wait $DJ 2>/dev/null
 
 rm -f counter.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"

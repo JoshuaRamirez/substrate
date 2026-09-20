@@ -24,13 +24,22 @@ int main(void) {
     f("path",        offsetof(cnt_seg, path),        CNT_PATHLEN);
     f("admin",       offsetof(cnt_seg, admin),       CNT_TOKLEN);
     f("next_id",     offsetof(cnt_seg, next_id),     sizeof(uint64_t));
+    f("block_free",  offsetof(cnt_seg, block_free),  sizeof(uint64_t));
+    f("block_owner", offsetof(cnt_seg, block_owner), sizeof(uint64_t) * CNT_BLOCKS);
+    f("blobs",       offsetof(cnt_seg, blobs),       sizeof(cnt_blob) * CNT_KEYS);
     f("ring",        offsetof(cnt_seg, ring),        sizeof(cnt_slot) * CNT_RING_SLOTS);
+    f("arena",       offsetof(cnt_seg, arena),       CNT_ARENA_SIZE);
     f("peers",       offsetof(cnt_seg, peers),       sizeof(cnt_peer) * CNT_MAX_PEERS);
+    printf("\narena          %zu blocks x %d bytes = %zu\n",
+           (size_t)CNT_BLOCKS, CNT_BLOCK_SIZE, CNT_ARENA_SIZE);
     printf("\nslot           %6zu bytes  x%d\n", sizeof(cnt_slot), CNT_RING_SLOTS);
     f("  .state",  offsetof(cnt_slot, state),  sizeof(uint32_t));
+    f("  .op",     offsetof(cnt_slot, op),     sizeof(uint32_t));
     f("  .client", offsetof(cnt_slot, client), sizeof(uint64_t));
     f("  .arg",    offsetof(cnt_slot, arg),    sizeof(uint64_t));
     f("  .result", offsetof(cnt_slot, result), sizeof(uint64_t));
+    f("  .len",    offsetof(cnt_slot, len),    sizeof(uint64_t));
+    f("  .block",  offsetof(cnt_slot, block),  sizeof(uint64_t));
     f("  .err",    offsetof(cnt_slot, err),    sizeof(uint32_t));
     printf("\npeer           %6zu bytes  x%d\n", sizeof(cnt_peer), CNT_MAX_PEERS);
     f("  .state", offsetof(cnt_peer, state), sizeof(uint32_t));

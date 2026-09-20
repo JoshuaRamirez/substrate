@@ -10,24 +10,28 @@
 import Darwin
 
 // ---- the contract (see: ./bin/layout) ----
-let SHM_NAME   = "/cnt.v6"
-let MAGIC:  UInt32 = 0x434E5436
-let VERSION: UInt32 = 6
-let SEG_SIZE = 2648
+let SHM_NAME   = "/cnt.v7"
+let MAGIC:  UInt32 = 0x434E5437
+let VERSION: UInt32 = 7
+let SEG_SIZE = 67141632
 
 let OFF_MAGIC     = 0
 let OFF_VERSION   = 4
 let OFF_COUNT     = 8
 let OFF_OWNER_PID = 16
 let OFF_NEXT_ID   = 336
-let OFF_RING      = 344
-let OFF_PEERS     = 1624
+let OFF_ARENA     = 32768
+let BLOCK_SIZE    = 1048576
+let OFF_RING      = 7008
+let OFF_PEERS     = 8800
 
-let SLOT_SIZE = 40, SLOT_N = 32
-let SLOT_STATE = 0, SLOT_CLIENT = 8, SLOT_ARG = 16, SLOT_RESULT = 24, SLOT_ERR = 32
+let SLOT_SIZE = 56, SLOT_N = 32
+let SLOT_STATE = 0, SLOT_OP = 4, SLOT_CLIENT = 8, SLOT_ARG = 16
+let SLOT_RESULT = 24, SLOT_LEN = 32, SLOT_BLOCK = 40, SLOT_ERR = 48
+let OP_RESERVE: Int32 = 0, OP_GET: Int32 = 2
 let SLOT_FREE: UInt32 = 0, SLOT_REQUEST: UInt32 = 1, SLOT_DONE: UInt32 = 2
 
-let PEER_SIZE = 64, PEER_N = 16
+let PEER_SIZE = 64, PEER_N = 256
 let PEER_STATE = 0, PEER_PID = 8, PEER_OPS = 16, PEER_SINCE = 24
 let PEER_NAME = 32, PEER_ROLE = 48, NAMELEN = 16
 
@@ -127,6 +131,7 @@ func reserve(_ b: UnsafeMutableRawPointer, _ n: UInt64) -> UInt64 {
     if mine < 0 { return 0 }
     let s = OFF_RING + mine * SLOT_SIZE
     u64ptr(b, s + SLOT_CLIENT).pointee = UInt64(getpid())
+    i32ptr(b, s + SLOT_OP).pointee     = OP_RESERVE
     u64ptr(b, s + SLOT_ARG).pointee    = n
     i32ptr(b, s + SLOT_ERR).pointee    = 0
     OSMemoryBarrier()

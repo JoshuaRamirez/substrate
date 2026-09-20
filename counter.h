@@ -33,15 +33,23 @@
 #include <time.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sched.h>
 #include <errno.h>
 
-#define CNT_SHM_NAME  "/cnt.v6"      /* macOS caps shm names at 31 chars */
-#define CNT_MAGIC     0x434E5436u    /* "CNT6" */
-#define CNT_VERSION   6u             /* pin the FORMAT, not the binary */
-#define CNT_MAX_PEERS 16
+#define CNT_SHM_NAME  "/cnt.v7"      /* macOS caps shm names at 31 chars */
+#define CNT_MAGIC     0x434E5437u    /* "CNT7" */
+#define CNT_VERSION   7u             /* pin the FORMAT, not the binary */
+#define CNT_MAX_PEERS 256            /* was 16, which silently capped contention
+                                      * tests at 16 peers no matter how many
+                                      * ring slots existed. The registry, not
+                                      * the ring, was the scaling limit. */
 #define CNT_NAMELEN   16
 #define CNT_PATHLEN   256
 #define CNT_RING_SLOTS 32
+#define CNT_BLOCKS     64                 /* arena blocks, one bitmap word each side */
+#define CNT_BLOCK_SIZE (1024 * 1024)      /* 64 MB of arena in total */
+#define CNT_ARENA_SIZE ((size_t)CNT_BLOCKS * CNT_BLOCK_SIZE)
+#define CNT_KEYS       256                /* blob store slots */
 #define CNT_TOKLEN    33             /* 128 bits, hex, + NUL */
 
 /* One row of the dashboard. Written only by the process that claimed it. */
@@ -70,15 +78,49 @@ typedef struct {
  * table, turned sideways. */
 typedef struct {
     _Atomic uint32_t state;      /* CNT_SLOT_* below */
+    _Atomic uint32_t op;         /* CNT_OP_* */
     _Atomic uint64_t client;     /* pid, so the owner can free a dead caller's slot */
-    _Atomic uint64_t arg;        /* how many ids to reserve */
-    _Atomic uint64_t result;     /* the base of the reserved range */
-    _Atomic uint32_t err;        /* 0 ok, 1 refused */
+    _Atomic uint64_t arg;        /* reserve: how many ids. put/get: the key. */
+    _Atomic uint64_t result;     /* reserve: base id. get: block index. */
+    _Atomic uint64_t len;        /* put/get: payload length */
+    _Atomic uint64_t block;      /* put: which arena block holds the payload */
+    _Atomic uint32_t err;        /* 0 ok, nonzero refused */
 } cnt_slot;
+
+/* One entry of the blob store the owner keeps. */
+typedef struct {
+    _Atomic uint64_t key;        /* 0 = empty */
+    _Atomic uint64_t block;
+    _Atomic uint64_t len;
+} cnt_blob;
 
 #define CNT_SLOT_FREE    0u
 #define CNT_SLOT_REQUEST 1u
 #define CNT_SLOT_DONE    2u
+#define CNT_SLOT_SERVING 3u   /* the owner has taken it; the client may NOT reclaim */
+#define CNT_SLOT_CLAIMED 4u   /* the client holds it but has not filled it in yet */
+
+/* Why SERVING exists.
+ *
+ * Without it, a client that timed out set its slot back to FREE -- possibly
+ * while the owner was midway through serving that very slot. A new client
+ * would claim the slot, and the owner's stale write would land on the new
+ * request. The id allocated for the first caller reached nobody.
+ *
+ * Under 64 concurrent clients that leaked 3703 ids out of 128000. It is
+ * invisible below the core count: with a spare core per client, nothing ever
+ * times out, so the window never opens. Contention did not slow this design
+ * down, it found a correctness bug in it.
+ *
+ * Now the handoff is a CAS both ways. The owner takes REQUEST -> SERVING, so
+ * a timing-out client can only reclaim a slot nobody has picked up yet. If it
+ * loses that race the work is already in flight, so it waits for the answer
+ * rather than abandoning an id that has already been spent. */
+
+/* What a slot is asking for. */
+#define CNT_OP_RESERVE   0u
+#define CNT_OP_PUT       1u    /* hand a block to the owner; it keeps it */
+#define CNT_OP_GET       2u    /* ask where a blob is; read it in place */
 
 /* The entire shared "database". */
 typedef struct {
@@ -91,8 +133,14 @@ typedef struct {
     char              path[CNT_PATHLEN];   /* absolute; the owner's database */
     char              admin[CNT_TOKLEN];   /* minted by the owner before `magic` */
     _Atomic uint64_t  next_id;             /* the id space the ring hands out */
+    _Atomic uint64_t  block_free;          /* bitmap: 1 = free. 64 blocks, 64 bits. */
+    _Atomic uint64_t  block_owner[CNT_BLOCKS];   /* pid holding each block, 0 = owner's */
+    cnt_blob          blobs[CNT_KEYS];
     cnt_slot          ring[CNT_RING_SLOTS];
     cnt_peer          peers[CNT_MAX_PEERS];
+    /* The arena goes LAST and is page-aligned, so the header stays small and a
+     * peer that only wants the counter never touches 64 MB of anything. */
+    _Alignas(16384) uint8_t arena[CNT_ARENA_SIZE];
 } cnt_seg;
 
 typedef struct {
@@ -222,6 +270,66 @@ static inline int counter_revalidate(counter *c) {
 }
 
 
+
+/* ---- the arena: payloads that are never copied across the boundary ----
+ *
+ * The ring carries small fixed-size words. A payload cannot go in it, and
+ * copying one through a socket is exactly the cost this whole design exists
+ * to avoid. So payloads live in the segment, and what crosses the boundary is
+ * a DESCRIPTOR: a block index and a length.
+ *
+ * A reader never copies. It is handed an offset into a page it already has
+ * mapped, and it reads the bytes in place. That is the difference between
+ * this and a socket, and it is the reason the gap widens with payload size
+ * instead of staying constant.
+ *
+ * Allocation is one 64-bit bitmap and a CAS. 64 blocks of 1 MB. Each block
+ * records the pid holding it, so the owner can reclaim what a dead peer left.
+ */
+
+/* Claim a free block. Returns its index, or -1 if the arena is full. */
+static inline int cnt_block_alloc(cnt_seg *s) {
+    for (int tries = 0; tries < 4096; tries++) {
+        uint64_t m = atomic_load_explicit(&s->block_free, memory_order_relaxed);
+        if (m == 0) return -1;                       /* arena full: real backpressure */
+        int i = __builtin_ctzll(m);
+        uint64_t want = m & ~(1ull << i);
+        if (atomic_compare_exchange_weak_explicit(&s->block_free, &m, want,
+                memory_order_acquire, memory_order_relaxed)) {
+            atomic_store(&s->block_owner[i], (uint64_t)getpid());
+            return i;
+        }
+    }
+    return -1;
+}
+
+static inline void cnt_block_free(cnt_seg *s, int i) {
+    if (i < 0 || i >= CNT_BLOCKS) return;
+    atomic_store(&s->block_owner[i], 0);
+    atomic_fetch_or_explicit(&s->block_free, 1ull << i, memory_order_release);
+}
+
+/* The bytes themselves. No copy happens here -- this is address arithmetic. */
+static inline uint8_t *cnt_block_ptr(cnt_seg *s, int i) {
+    return (i < 0 || i >= CNT_BLOCKS) ? NULL : s->arena + (size_t)i * CNT_BLOCK_SIZE;
+}
+
+/* Reclaim blocks whose holder is gone. The owner calls this; pid 0 means the
+ * owner itself took the block, and those are freed with their blob entry. */
+static inline int cnt_reap_blocks(cnt_seg *s) {
+    int n = 0;
+    for (int i = 0; i < CNT_BLOCKS; i++) {
+        if (atomic_load(&s->block_free) & (1ull << i)) continue;
+        pid_t h = (pid_t)atomic_load(&s->block_owner[i]);
+        if (h > 0 && kill(h, 0) != 0) { cnt_block_free(s, i); n++; }
+    }
+    return n;
+}
+
+static inline int cnt_blocks_free(cnt_seg *s) {
+    return __builtin_popcountll(atomic_load(&s->block_free));
+}
+
 /* ---- reserve: the verb whose answer the caller waits for ----
  *
  * THE TEST. Every other call here is a store the caller walks away from.
@@ -234,7 +342,34 @@ static inline int counter_revalidate(counter *c) {
  * magnitude apart. The abstraction holds; the performance does not pretend to.
  */
 
-#define CNT_RESERVE_TIMEOUT_NS 2000000000ll   /* 2 seconds, measured on a clock */
+
+/* ---- waiting without starving the thing you are waiting for ----
+ *
+ * Spinning is right when the reply is nanoseconds away and there is a spare
+ * core to spin on. Neither holds under load: with more clients than cores,
+ * every spinning client is stealing CPU from the single owner that has to
+ * answer all of them. Measured, 64 clients on 16 cores spinning flat out took
+ * throughput from 2.3M/s to 16k/s and pushed tail latency into the 2-second
+ * timeout -- requests DROPPED, not merely delayed.
+ *
+ * So: spin only briefly, then yield, then sleep. The yield is the important
+ * step, because it is what lets the owner run.
+ */
+static inline void cnt_backoff(long attempt) {
+    if (attempt < 64) {
+#if defined(__aarch64__)
+        __asm__ __volatile__("yield");
+#elif defined(__x86_64__)
+        __asm__ __volatile__("pause");
+#endif
+    } else if (attempt < 256) {
+        sched_yield();                 /* let the owner have the core */
+    } else {
+        usleep(50);                    /* deeply contended: get out of the way */
+    }
+}
+
+#define CNT_CALL_TIMEOUT_NS 2000000000ll   /* 2 seconds, measured on a clock */
 
 static inline int64_t cnt_now_ns(void) {
     struct timespec t;
@@ -242,59 +377,135 @@ static inline int64_t cnt_now_ns(void) {
     return (int64_t)t.tv_sec * 1000000000ll + t.tv_nsec;
 }
 
-/* Returns the base of a reserved range of `n` ids, or 0 on failure. */
-static inline uint64_t counter_reserve(counter *c, uint64_t n) {
-    if (n == 0) return 0;
+/* What one call returns. */
+typedef struct {
+    uint64_t result;      /* reserve: base id.  get: block index. */
+    uint64_t len;         /* get: payload length */
+    uint32_t err;         /* 0 ok */
+    int      full;        /* 1 = no slot was free: this is backpressure, not failure */
+} cnt_reply;
 
-    if (!c->seg) {                        /* alone (or detached): we are the owner */
-        return atomic_fetch_add_explicit(&c->own_next, n, memory_order_relaxed);
-    }
+/* ---- backpressure ----
+ *
+ * The ring has 32 slots. More than 32 callers in flight is not an error, it is
+ * a full queue, and the two are worth telling apart: a full queue means WAIT,
+ * a failure means GIVE UP. Returning 0 for both -- which is what this did
+ * before -- silently turns an overload into data loss.
+ *
+ * So the slot claim spins with a bounded backoff until a slot frees or the
+ * deadline passes, and the caller is told which happened. No request is
+ * dropped while any slot is cycling; throughput degrades, correctness does
+ * not.
+ */
+static inline cnt_reply cnt_call(cnt_seg *s, uint32_t op, uint64_t arg,
+                                 uint64_t len, uint64_t block, int64_t timeout_ns) {
+    cnt_reply r = {0, 0, 0, 0};
+    int64_t deadline = cnt_now_ns() + timeout_ns;
 
-    cnt_seg *s = c->seg;
     cnt_slot *mine = NULL;
-    for (int i = 0; i < CNT_RING_SLOTS && !mine; i++) {
-        uint32_t expect = CNT_SLOT_FREE;
-        if (atomic_compare_exchange_strong(&s->ring[i].state, &expect, CNT_SLOT_REQUEST))
-            mine = &s->ring[i];           /* claimed: the slot is ours until DONE */
+    for (long attempt = 0; !mine; attempt++) {
+        for (int i = 0; i < CNT_RING_SLOTS && !mine; i++) {
+            uint32_t expect = CNT_SLOT_FREE;
+            /* CLAIMED, not REQUEST: the slot is ours but its fields are still
+             * the PREVIOUS caller's. Publishing REQUEST here would let the
+             * owner read stale args and spend ids on them -- 784 leaked out of
+             * 128000 before this line said CLAIMED. Publish the state LAST,
+             * the same rule dbd uses for `magic`. */
+            if (atomic_compare_exchange_strong(&s->ring[i].state, &expect, CNT_SLOT_CLAIMED))
+                mine = &s->ring[i];
+        }
+        if (mine) break;
+        if (cnt_now_ns() > deadline || !cnt_owner_alive(s)) { r.full = 1; return r; }
+        cnt_backoff(attempt);
     }
-    if (!mine) return 0;                  /* ring full: every slot in flight */
 
     atomic_store(&mine->client, (uint64_t)getpid());
-    atomic_store(&mine->arg, n);
+    atomic_store(&mine->op, op);
+    atomic_store(&mine->arg, arg);
+    atomic_store(&mine->len, len);
+    atomic_store(&mine->block, block);
     atomic_store(&mine->err, 0);
-    atomic_store_explicit(&mine->state, CNT_SLOT_REQUEST, memory_order_release);
+    atomic_store(&mine->result, 0);
+    atomic_store_explicit(&mine->state, CNT_SLOT_REQUEST, memory_order_release);  /* now it is real */
 
-    uint64_t base = 0;
-    int64_t deadline = cnt_now_ns() + CNT_RESERVE_TIMEOUT_NS;
     for (long spin = 0; ; spin++) {
         if (atomic_load_explicit(&mine->state, memory_order_acquire) == CNT_SLOT_DONE) {
-            base = atomic_load(&mine->err) ? 0 : atomic_load(&mine->result);
+            r.err    = atomic_load(&mine->err);
+            r.result = atomic_load(&mine->result);
+            r.len    = atomic_load(&mine->len);
             atomic_store(&mine->client, 0);
             atomic_store_explicit(&mine->state, CNT_SLOT_FREE, memory_order_release);
-            return base;
+            return r;
         }
-        /* An owner that died mid-request must not hang us forever -- and the
-         * cutoff is wall time, not a spin count, because a spin count silently
-         * means "4ms" on a fast machine and "40ms" on a slow one. */
-        if ((spin & 0x3FFF) == 0x3FFF) {
+        cnt_backoff(spin);
+        /* Wall time, not a spin count: a spin count silently means 4ms on a
+         * fast machine and 40ms on a slow one. */
+        if ((spin & 0x3FF) == 0x3FF) {
             if (!cnt_owner_alive(s)) break;
-            if (cnt_now_ns() > deadline) break;
+            if (cnt_now_ns() > deadline) {
+                /* Give up ONLY if the owner has not taken the slot. If this
+                 * CAS fails the request is in flight and its id is already
+                 * spent, so abandoning it would lose an id forever. */
+                uint32_t mineNow = CNT_SLOT_REQUEST;
+                if (atomic_compare_exchange_strong(&mine->state, &mineNow, CNT_SLOT_FREE)) {
+                    atomic_store(&mine->client, 0);
+                    r.err = 0xFFFF;
+                    return r;
+                }
+                deadline = cnt_now_ns() + CNT_CALL_TIMEOUT_NS;   /* in flight: wait it out */
+            }
         }
     }
-    atomic_store(&mine->client, 0);       /* give the slot back; we gave up */
-    atomic_store_explicit(&mine->state, CNT_SLOT_FREE, memory_order_release);
+    /* Owner died mid-call. The slot is unreclaimable by us; the owner's
+     * successor reaps it by pid. */
+    r.err = 0xFFFF;
+    return r;
+}
+
+/* ---- the verbs ---- */
+
+/* Returns the base of a reserved range of `n` ids, or 0 on failure.
+ * Same call site in both modes: alone it is an add, joined it is a round trip. */
+static inline uint64_t counter_reserve(counter *c, uint64_t n) {
+    if (n == 0) return 0;
+    if (!c->seg) return atomic_fetch_add_explicit(&c->own_next, n, memory_order_relaxed);
+    cnt_reply r = cnt_call(c->seg, CNT_OP_RESERVE, n, 0, 0, CNT_CALL_TIMEOUT_NS);
+    return r.err ? 0 : r.result;
+}
+
+/* Store a payload under `key`. ONE copy: caller's buffer -> arena. After that
+ * the bytes never move again, however many readers there are. */
+static inline int counter_put(counter *c, uint64_t key, const void *data, uint64_t len) {
+    if (!c->seg || len == 0 || len > CNT_BLOCK_SIZE) return -1;
+    int b = cnt_block_alloc(c->seg);
+    if (b < 0) return -2;                              /* arena full */
+    memcpy(cnt_block_ptr(c->seg, b), data, (size_t)len);
+    cnt_reply r = cnt_call(c->seg, CNT_OP_PUT, key, len, (uint64_t)b, CNT_CALL_TIMEOUT_NS);
+    if (r.err || r.full) { cnt_block_free(c->seg, b); return -3; }
     return 0;
 }
 
+/* Locate a payload. Returns a pointer INTO THE SHARED PAGE -- zero copies.
+ * The caller reads the bytes where they already are. */
+static inline const uint8_t *counter_get(counter *c, uint64_t key, uint64_t *len_out) {
+    if (!c->seg) return NULL;
+    cnt_reply r = cnt_call(c->seg, CNT_OP_GET, key, 0, 0, CNT_CALL_TIMEOUT_NS);
+    if (r.err || r.full) return NULL;
+    if (len_out) *len_out = r.len;
+    return cnt_block_ptr(c->seg, (int)r.result);
+}
+
 /* The owner side. Serves every pending slot; returns how many it served.
- * Call it in a tight loop -- which is the real cost of this verb: the owner
- * stops being a housekeeper on a 100ms tick and becomes a server. */
+ * Call it in a tight loop -- which is the real cost of a reply-carrying verb:
+ * the owner stops being a housekeeper on a tick and becomes a server. */
 static inline int cnt_serve_ring(cnt_seg *s) {
     int served = 0;
     for (int i = 0; i < CNT_RING_SLOTS; i++) {
         cnt_slot *q = &s->ring[i];
-        if (atomic_load_explicit(&q->state, memory_order_acquire) != CNT_SLOT_REQUEST)
-            continue;
+        uint32_t want = CNT_SLOT_REQUEST;
+        if (!atomic_compare_exchange_strong_explicit(&q->state, &want, CNT_SLOT_SERVING,
+                memory_order_acquire, memory_order_relaxed))
+            continue;                       /* not ours, or already taken */
 
         pid_t who = (pid_t)atomic_load(&q->client);
         if (who > 0 && kill(who, 0) != 0) {        /* caller died mid-call */
@@ -302,15 +513,58 @@ static inline int cnt_serve_ring(cnt_seg *s) {
             atomic_store_explicit(&q->state, CNT_SLOT_FREE, memory_order_release);
             continue;
         }
-        uint64_t n = atomic_load(&q->arg);
-        if (n == 0 || n > (1ull << 32)) {
-            atomic_store(&q->err, 1);
-            atomic_store(&q->result, 0);
+
+        uint32_t op  = atomic_load(&q->op);
+        uint64_t arg = atomic_load(&q->arg);
+        atomic_store(&q->err, 0);
+
+        if (op == CNT_OP_RESERVE) {
+            if (arg == 0 || arg > (1ull << 32)) { atomic_store(&q->err, 1); }
+            else atomic_store(&q->result,
+                     atomic_fetch_add_explicit(&s->next_id, arg, memory_order_relaxed));
+
+        } else if (op == CNT_OP_PUT) {
+            uint64_t len = atomic_load(&q->len);
+            int      blk = (int)atomic_load(&q->block);
+            if (arg == 0 || blk < 0 || blk >= CNT_BLOCKS || len > CNT_BLOCK_SIZE) {
+                atomic_store(&q->err, 2);
+            } else {
+                int slot = -1, reuse = -1;
+                for (int k = 0; k < CNT_KEYS; k++) {
+                    uint64_t kk = atomic_load(&s->blobs[k].key);
+                    if (kk == arg) { reuse = k; break; }
+                    if (kk == 0 && slot < 0) slot = k;
+                }
+                if (reuse >= 0) {           /* replace: free what it pointed at */
+                    cnt_block_free(s, (int)atomic_load(&s->blobs[reuse].block));
+                    slot = reuse;
+                }
+                if (slot < 0) { atomic_store(&q->err, 3); }      /* blob table full */
+                else {
+                    atomic_store(&s->block_owner[blk], 0);       /* the owner holds it now */
+                    atomic_store(&s->blobs[slot].block, (uint64_t)blk);
+                    atomic_store(&s->blobs[slot].len, len);
+                    atomic_store(&s->blobs[slot].key, arg);
+                    atomic_store(&q->result, (uint64_t)blk);
+                }
+            }
+
+        } else if (op == CNT_OP_GET) {
+            int found = 0;
+            for (int k = 0; k < CNT_KEYS; k++) {
+                if (atomic_load(&s->blobs[k].key) == arg) {
+                    atomic_store(&q->result, atomic_load(&s->blobs[k].block));
+                    atomic_store(&q->len,    atomic_load(&s->blobs[k].len));
+                    found = 1;
+                    break;
+                }
+            }
+            if (!found) atomic_store(&q->err, 4);
+
         } else {
-            atomic_store(&q->err, 0);
-            atomic_store(&q->result,
-                atomic_fetch_add_explicit(&s->next_id, n, memory_order_relaxed));
+            atomic_store(&q->err, 5);
         }
+
         atomic_store_explicit(&q->state, CNT_SLOT_DONE, memory_order_release);
         served++;
     }

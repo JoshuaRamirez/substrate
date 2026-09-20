@@ -121,6 +121,7 @@ int main(int argc, char **argv) {
     atomic_store(&g_seg->owner_pid, (uint64_t)getpid());
     atomic_store(&g_seg->path_writer, 0);
     atomic_store(&g_seg->next_id, 1);   /* id 0 means "failed" */
+    atomic_store(&g_seg->block_free, ~0ull);   /* every arena block free */
     cnt_mint_admin(g_seg);        /* before magic: no peer sees a tokenless segment */
     g_seg->version = CNT_VERSION;
     g_seg->magic   = CNT_MAGIC;   /* magic last: peers see a valid segment or none */
@@ -167,6 +168,7 @@ int main(int argc, char **argv) {
             fflush(stdout);
         }
         cnt_reap_ring(g_seg);
+        cnt_reap_blocks(g_seg);
         int reaped = cnt_reap(g_seg);
         if (reaped) { printf("dbd: reaped %d dead peer(s)\n", reaped); fflush(stdout); }
 
