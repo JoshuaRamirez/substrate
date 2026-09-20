@@ -18,6 +18,11 @@ no third-party code. Each is one translation unit.
 | `bin/webd` | an HTTP driver. ~110 lines of BSD sockets. |
 | `bin/gui`  | a native Cocoa window. Not a webview. No HTML. No toolkit to install. |
 | `bin/top`  | a native dashboard of every running peer. Docker Desktop, minus Docker. |
+| `bin/look` | one instance, complete alone: a 1,000,000-record database inside the binary. |
+| `bin/swiftpeer` | a Swift peer. Different toolchain, different runtime, same page. |
+| `pypeer.py` | a Python peer. No compilation at all. |
+| `bin/layout` | prints the binary contract the three languages agree on. |
+| `bin/bench` | the numbers, against AF_UNIX and TCP loopback. |
 
 They share one `u64` and a 16-slot peer table in one shared-memory page.
 
@@ -86,7 +91,7 @@ native dashboard needs no token.
 ## The admin layer
 
 **The trust boundary is the shm file mode, not a password.** Anything that can
-map `/cnt.v5` can already write every value in it, so peers are inside by
+map `/cnt.v6` can already write every value in it, so peers are inside by
 construction — `bin/top` moves the database with no token and no prompt. It
 does not ask permission, because asking would be theatre.
 
@@ -162,17 +167,17 @@ No cache, no subscription, no invalidation, no push channel. **The frame
 loop is the subscription.** That is what the shared-memory model looks like
 when you draw it.
 
-## What was cut, and why it was safe
+## What was cut at the start, and what came back
 
 | Cut | Why it isn't required for the claim |
 |---|---|
 | Arrow / any data format | One `u64`. Format generality is a different axis. |
 | IDL + code generation | With one verb, write both impls by hand. Keep the discipline, drop the generator. |
-| A ring buffer | An increment is a single atomic. See below. |
+| A ring buffer | An increment is a single atomic. **Came back** — the reply-carrying verb needed one. |
 | Real engine (LMDB/SQLite/DuckDB) | "Database" here means *single owner of mutable state*. That's the property under test. |
-| Data appended to the binary + custom VFS | That is the **read** path. This is a **write**. Orthogonal. |
+| Data appended to the binary + custom VFS | That is the **read** path. **Came back** — see *The database inside the executable*. |
 | Supervisor, manifest, capabilities | Three processes and a hardcoded segment name. |
-| Crash recovery, liveness, restart | If `dbd` dies, everyone dies. Acceptable at this size. |
+| Crash recovery, liveness, restart | If `dbd` dies, everyone dies. **Came back** — peers detach and re-attach. |
 | Async, threads, backpressure | Not reachable at this size. |
 
 The sharpest cut is the ring buffer. **When the boundary is memory, some
@@ -185,6 +190,86 @@ truth* of the cell, not each individual write. The moment an operation
 arrives that cannot be a single atomic, `dbd` becomes a real mediator and
 the ring buffer appears. That is the next increment, and it should be
 resisted until this one runs.
+
+## The database inside the executable
+
+The other half of the original idea. A 1,000,000-record table is linked into
+the binary's read-only `__TEXT` segment with `-sectcreate`, so:
+
+- **dyld maps it at exec.** "Loading the database" is not an operation — no
+  `open()`, no `read()`, no deserialise. The records are addressable memory
+  when `main()` starts. Carrying 40 MB costs about **245 µs** extra per launch.
+- **N copies share one physical copy.** `__TEXT` is read-only and file-backed,
+  so the OS page cache deduplicates it with no coordination and no server.
+  Measured: 8 instances, each with the whole table resident (39.5 MB RSS
+  apiece, **316 MB apparent**), consumed **65 MB** of real memory.
+- **The on-disk form is the in-memory form.** Fixed-width records sorted by
+  key; lookup is a binary search over mapped bytes, ~1 µs over a million
+  records, cache-miss bound. Nothing is ever copied.
+
+```sh
+cd /tmp && ~/…/bin/look k000000042     # answers with no owner, no files, no network
+```
+
+`webd` carries it too, so one process holds **two** databases: a shared one it
+*joins* for writes, and a private read-only one it *carries*.
+
+## Three languages, one page
+
+`bin/layout` prints the contract: shm name, magic, version, every field offset.
+That output **is** the interface.
+
+| Peer | Toolchain | How it joins |
+|---|---|---|
+| `webd`, `gui`, `top` | clang / Objective-C | the `counter.h` header |
+| `bin/swiftpeer` | Swift 6.3 | its own `shm_open` (via `dlsym` — it's variadic), own `mmap`, own atomics. No Foundation, no C shim |
+| `pypeer.py` | CPython + ctypes | `shm_open`, `mmap` and the OSAtomic primitives through libSystem. Real atomics, not the GIL |
+
+Neither Swift nor Python shares a header, a library or a build step with the C
+programs. Verified: C bumps 2, Swift bumps 3, Python bumps 4 — all four
+processes agree the count is 9, and all three take contiguous ranges from one
+id space through the ring.
+
+Found only by doing it: `OSAtomicAdd64Barrier` returns the **new** value where
+C's `atomic_fetch_add` returns the **old** one. Same memory, same atomicity,
+opposite convention. Eight tests now assert the Swift and Python constants
+still match what C computes, because two languages agreeing on stale offsets
+read garbage and call it agreement.
+
+## The verb that waits
+
+`counter_reserve(n)` is the one call whose answer the caller needs back. Alone
+it is an add on private memory; joined it is a ring round trip. **Same call
+site.** That was the untested half of the whole claim.
+
+The ring needs no lock either, for a reason worth naming: a slot has exactly
+one writer at every point in its cycle — the client owns it in `FREE` and
+`DONE`, the owner owns it in `REQUEST`. **Ownership partitioned in time**
+rather than in space. The peer table's trick, turned sideways.
+
+## Numbers
+
+`./bin/bench --join`, same machine, same moment:
+
+| | | |
+|---|---|---|
+| `bump` joined | **2–4 ns** | a store into a shared page |
+| `reserve` joined (ring) | **0.5–2 µs** | full cross-process request *and reply* |
+| AF_UNIX round trip | 10–15 µs | **7–10× slower** |
+| TCP loopback round trip | 50 µs | **20–50× slower** |
+| embedded lookup | ~1 µs | binary search over 1,000,000 records |
+
+Absolute numbers drift with machine load; the ratios hold. The first design
+promised "single-digit microseconds" and measured nothing. The ring beats that.
+
+Two defects found *by measuring*, both fixed:
+
+- **A ring's latency is its owner's polling interval, nothing else.** `dbd`
+  slept 500 µs between polls, which made a 3 ns memory handoff cost **620 µs**
+  — worse than the TCP round trip it exists to beat.
+- **An iteration count is not a duration.** "200,000 spins ≈ 1 ms" was really
+  1.7 *seconds*, and housekeeping fell 17× behind. The same mistake was in the
+  client's timeout. Both are measured on a clock now.
 
 ## Hardening
 
@@ -228,7 +313,9 @@ Run `./test.sh`.
 | `--join` needs different code above the call site | **not falsified** — only the constructor differs |
 | Native GUI forces a system-installed toolkit | **not falsified** — Cocoa is the OS; `bin/gui` is 53K |
 | The binaries need a shared runtime or launcher to find each other | **not falsified** — one shm name, no discovery |
-| The shared cell needs a lock, and the lock needs a protocol | **not falsified for the cell** — but see below |
+| The shared cell needs a lock, and the lock needs a protocol | **not falsified** — see below |
+| A reply-carrying verb forces a ring, and the ring breaks the one-pointer property | **not falsified** — the ring exists, `counter_reserve` needs it, and the call site still does not change |
+| A second language cannot join without a C shim | **not falsified** — Swift and Python both join on the format alone |
 
 The fourth one fired, and it is worth being exact about how.
 
@@ -244,11 +331,21 @@ nothing. A buffer with many writers needs publication ordering, and that is
 cheap. The ring buffer becomes load-bearing at a third thing: an operation
 whose *result* other peers must wait on. Nothing here does yet.
 
-## What this deliberately does not prove
+## What this still does not prove
 
-Request/response latency, payload transfer, backpressure, multi-writer
-contention, crash recovery, cross-language ABI. All of those arrive with
-**the second verb**.
+The list has shrunk. Request/response latency, crash recovery and the
+cross-language ABI were all open and are now measured, tested and running.
+What is left:
+
+- **Payload transfer.** Every value crossing the boundary is small and fixed
+  size. Nothing here hands over a buffer, so the arena and descriptor half of
+  the original design is untouched.
+- **Backpressure.** The ring has 32 slots and returns 0 when full. There is no
+  queueing, no fairness and no flow control.
+- **More than one machine, one user, one OS.** All of this is macOS, loopback,
+  a single uid, and the trust boundary is the shm file mode.
+- **Contention at scale.** Benchmarks are one client at a time. Nothing here
+  says what 16 peers hammering 32 slots does.
 
 ## Sizes
 
