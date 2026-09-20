@@ -45,12 +45,68 @@ compare-exchange. That is the entire concurrency story.
 ## Run it
 
 ```sh
-./build.sh
-./test.sh          # the falsification criteria
-./run.sh           # the demo: dbd + webd + gui + top
+make               # build everything this OS can build
+make test          # the falsification criteria
+make run           # the demo: dbd + webd + gui + top
 ./run.sh alone     # the standalone half
 ./run.sh top       # the dashboard by itself
 ```
+
+Requirements: `clang`, `make`, and nothing else. On Linux add `binutils`
+(for `ld -r -b binary`) and `libatomic1` (for the Python peer). Swift and
+Cocoa are used if present and skipped if not.
+
+`make` generates a 40 MB table and links it into two of the binaries, so the
+first build is slower than the rest and `bin/look` and `bin/webd` come out
+at 38 MB. That is the point, not an accident — see *The database inside the
+executable*.
+
+## Install it
+
+```sh
+make install                      # /usr/local, so: sudo make install
+make install PREFIX=~/.local      # or somewhere you own
+```
+
+Everything lands under a `sub-` prefix — `sub-dbd`, `sub-webd`, `sub-gui`,
+`sub-top`, `sub-look`, `sub-layout`, `sub-bench`, `sub-pypeer` — plus
+`substrate.h` into `include/`. The prefix is not tidiness: this repo builds
+programs called `top` and `look`, and **both of those are real commands
+already on your PATH.** Installed bare, they would shadow them.
+
+`DESTDIR` is honoured, so packagers can stage into a build root.
+
+```sh
+sub-dbd &            # the owner: creates /sub.v8, restores the count
+sub-webd --join      # a peer:    http://localhost:8080
+sub-dbd --stop       # ask the owner to leave; it persists on the way out
+```
+
+## Uninstall it
+
+```sh
+make uninstall PREFIX=~/.local    # binaries, header, and the segment
+make purge     PREFIX=~/.local    # the above, and the database file too
+```
+
+Uninstall is not `rm`. A shared-memory object's **name outlives every
+process that ever mapped it** — delete the binaries alone and `/sub.v8` sits
+on the machine until you reboot, waiting for the next install to inherit a
+stranger's page. So `make uninstall` stops the owner first, lets it persist
+and unlink on its own exit, then removes the files.
+
+Two things it deliberately does *not* do:
+
+- **It leaves your database file.** `substrate.db` is data. `make purge`
+  takes it; nothing else will.
+- **It does not kill peers.** They do not die when the owner leaves — they
+  detach and keep counting against private memory, which is the entire claim
+  of this project. `sub-dbd --stop` prints each surviving pid by name so you
+  are not surprised by them later.
+
+`sub-dbd --unlink` releases the segment on its own, and **refuses while an
+owner is alive.** Unlinking removes the name, not the mapping: doing it
+under a live owner is the split brain this project already paid for once.
 
 Then: `curl localhost:8080/bump` and watch the number change in the native
 window. No websocket. No polling endpoint. No serialization. The GUI never
@@ -382,7 +438,7 @@ That was a real split brain, observed live, not a hypothesis.
 
 Built with `-Wall -Wextra -Wshadow -Wformat=2 -Wformat-security -Wcast-qual
 -Wvla -Wwrite-strings -fstack-protector-strong -D_FORTIFY_SOURCE=2`, clean.
-`./build.sh --san` builds the same sources under ASan + UBSan; the full suite
+`make san` builds the same sources under ASan + UBSan; the full suite
 passes there, and `webd` survives malformed request lines, header floods,
 5 KB tokens, embedded NULs and traversal attempts without a single sanitizer
 report.
@@ -398,7 +454,7 @@ Two things checked and deliberately **not** changed:
 
 ## Falsification criteria — results
 
-Run `./test.sh`.
+Run `make test`.
 
 | Criterion | Result |
 |---|---|
@@ -440,8 +496,36 @@ three of them found bugs on the way. What is honestly left:
 ## Sizes
 
 ```
-bin/dbd    50K
-bin/webd   34K
-bin/gui    53K
-bin/top    55K
+bin/dbd          51K    the owner
+bin/gui          53K    a native Cocoa window
+bin/top          55K    the dashboard
+bin/swiftpeer    57K    a second compiled toolchain
+bin/bench        34K
+bin/layout       33K    prints the contract
+bin/peer         33K    gui and top, minus the window, for machines without Cocoa
+bin/look         38M  \
+bin/webd         38M  /  these two carry the 1,000,000-record table inside them
 ```
+
+The 38 MB is the feature. Two processes running `bin/look` map the same
+read-only pages, so the second one costs nothing — see *The database inside
+the executable*.
+
+## Platforms
+
+| | macOS | Linux |
+|---|---|---|
+| `dbd` `webd` `look` `layout` `bench` `peer` | yes | yes |
+| `gui` `top` | yes (Cocoa) | no — `bin/peer` runs the same checks |
+| `swiftpeer` | if `swiftc` is present | if `swiftc` is present |
+| `pypeer.py` | libSystem atomics | libatomic atomics |
+| `./test.sh` | 108 pass | 97 pass, 3 skip |
+
+The segment is **67,141,632 bytes on both**, byte for byte, and both compute
+the same magic. That is asserted in CI, not just printed: if the two ever
+disagreed, a Linux peer and a macOS peer would read different fields out of
+the same bytes.
+
+## Licence
+
+MIT. See [LICENSE](LICENSE).

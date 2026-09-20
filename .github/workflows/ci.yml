@@ -1,0 +1,92 @@
+name: ci
+
+# The project's claim is that the same sources, the same segment layout and
+# the same test suite hold on two kernels and two libcs. That claim is only
+# worth anything if something checks it, so both halves run on every push.
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  macos:
+    name: macOS (clang, Cocoa, Swift)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build
+        run: make
+      - name: test
+        run: ./test.sh
+      - name: install and uninstall round trip
+        run: |
+          make install PREFIX="$HOME/.local"
+          export PATH="$HOME/.local/bin:$PATH"
+          sub-layout
+          sub-dbd /tmp/ci.db &
+          sleep 1
+          sub-webd --join &
+          # sub-webd carries the embedded table, so its first launch reads
+          # ~38 MB cold off disk. Wait for the port, do not guess a sleep.
+          for _ in $(seq 1 300); do
+            curl -sf -o /dev/null --max-time 2 localhost:8080/status && break
+            sleep 0.1
+          done
+          curl -sf localhost:8080/bump
+          sub-pypeer --bump 2
+          make uninstall PREFIX="$HOME/.local"
+          test ! -e "$HOME/.local/bin/sub-dbd"
+          test ! -e "$HOME/.local/include/substrate.h"
+
+  linux:
+    name: Linux (clang, glibc)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        # libatomic1 is not optional: pypeer.py refuses to run without it
+        # rather than pretend the GIL is a memory barrier.
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang binutils libatomic1
+      - name: build
+        run: make CC=clang
+      - name: test
+        # gui, top and swiftpeer do not exist here; the suite says SKIP and
+        # runs the same checks against bin/peer.
+        run: ./test.sh
+      - name: install and uninstall round trip
+        run: |
+          make install PREFIX="$HOME/.local"
+          export PATH="$HOME/.local/bin:$PATH"
+          sub-layout
+          make uninstall PREFIX="$HOME/.local"
+          test ! -e "$HOME/.local/bin/sub-dbd"
+
+  sanitizers:
+    name: ASan + UBSan (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: build instrumented
+        run: make san
+      - name: test
+        run: ./test.sh
+
+  agreement:
+    name: the two builds agree on the format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq clang binutils
+      - name: the segment layout is the contract
+        # If these ever differ between platforms, a Linux peer and a macOS
+        # peer would read different fields out of the same bytes. The numbers
+        # are asserted, not just printed.
+        run: |
+          make CC=clang bin/layout
+          ./bin/layout
+          ./bin/layout | grep -q '^size       67141632'
+          ./bin/layout | grep -q '^magic      0x53554238'
+          ./bin/layout | grep -q '^version    8'
