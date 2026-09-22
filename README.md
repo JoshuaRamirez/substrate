@@ -100,7 +100,7 @@ sub-dbd &                                          # the registry
 sub run --name api --role http:8099 -- node server.js
 sub run --name worker --role queue   -- python3 worker.py
 sub ps
-sub stop api
+sub stop api          # --force to SIGKILL what ignores SIGTERM
 ```
 
 ```
@@ -122,6 +122,18 @@ Three details that are easy to get backwards, and are tested:
 - **Nobody has to release a row.** A `SIGKILL`ed service never gets to clean
   up, and is reaped anyway. That is what makes this work for processes that
   never agreed to anything.
+- **Stopping a service stops everything it forked.** `sub run` puts the child
+  in its own process group and `sub stop` signals the group. Without that, a
+  service under a shell or with worker processes left its workers running,
+  reparented to pid 1, while `sub stop` reported success. A peer that joined
+  on its own and does *not* lead a group is signalled alone, so stopping it
+  can never take its shell down too.
+- **`sub stop` is `SIGTERM`, then an honest answer.** It waits up to 10 s; a
+  service still running after that is reported (exit 4), not assumed gone.
+  `sub stop --force` escalates to `SIGKILL`. Stopping writes nothing to the
+  shared page — the table is a directory for finding the pid, and the kernel
+  delivers the signal, which is why it works on processes that never heard of
+  substrate.
 - **`sub run` refuses when the registry is down.** A service you believe is
   managed and is not is worse than one that would not start. `--anyway` runs
   it unregistered, but you have to ask.

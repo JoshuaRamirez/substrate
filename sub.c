@@ -29,8 +29,10 @@ static pid_t g_child = 0;
 
 /* Forward what we are told to the thing we are supervising. The wrapper is a
  * conduit, not a policy: it does not decide that SIGTERM means stop. */
+/* The child leads its own process group (see do_run), so forward to the
+ * GROUP: a service's workers are part of the service. */
 static void on_sig(int s) {
-    if (g_child > 0) kill(g_child, s);
+    if (g_child > 0) kill(-g_child, s);
 }
 
 static void fmt_age(uint64_t s, char *out, size_t cap) {
@@ -93,12 +95,18 @@ static int do_ps(void) {
 
 /* ---- sub stop ---- */
 
-static int do_stop(const char *who) {
+/* Is anything in this target still alive? For a group, kill(-pgid, 0)
+ * fails with ESRCH only once every member is gone. */
+static int target_alive(pid_t pid, int group) {
+    return kill(group ? -pid : pid, 0) == 0;
+}
+
+static int do_stop(const char *who, int force) {
     sub_seg *s = need_seg();
     if (!s) return 1;
 
     pid_t want = 0;
-    int hit = 0, rc = 0;
+    int hit = 0;
     for (int i = 0; i < SUB_MAX_PEERS; i++) {
         sub_peer *p = &s->peers[i];
         if (!sub_peer_alive(p)) continue;
@@ -115,27 +123,43 @@ static int do_stop(const char *who) {
         }
         want = (pid_t)atomic_load(&p->pid);
         hit = 1;
-        printf("sub: SIGTERM -> %s (pid %d)\n", who, (int)want);
-        if (kill(want, SIGTERM) < 0) { perror("sub: kill"); rc = 1; }
         break;
     }
+    munmap(s, sizeof *s);
     if (!hit) {
         fprintf(stderr, "sub: no live peer named '%s'\n", who);
-        munmap(s, sizeof *s);
         return 2;
     }
 
+    /* Signal the group only when the pid LEADS one. `sub run` children do. A
+     * C peer that joined on its own (webd --join from a shell) shares its
+     * shell's group, and signalling that group would take the shell with it. */
+    int group = getpgid(want) == want;
+    printf("sub: SIGTERM -> %s (%s %d)\n", who, group ? "group" : "pid", (int)want);
+    if (kill(group ? -want : want, SIGTERM) < 0) { perror("sub: kill"); return 1; }
+
     /* Wait on the OS, not on a row: the row clears when dbd next reaps, which
      * is a housekeeping cadence, not a fact about the process. */
-    for (int i = 0; i < 100 && kill(want, 0) == 0; i++) usleep(100000);
-    if (kill(want, 0) == 0) {
-        fprintf(stderr, "sub: pid %d still running after 10s\n", (int)want);
-        rc = 4;
-    } else {
-        printf("sub: %s stopped\n", who);
+    for (int i = 0; i < 100 && target_alive(want, group); i++) usleep(100000);
+    if (!target_alive(want, group)) { printf("sub: %s stopped\n", who); return 0; }
+
+    /* Refusing to escalate unasked is the default: you said stop, not kill.
+     * But a stop that can quietly not stop is a thin promise, so the failure
+     * is loud and the escalation is one flag away. */
+    if (!force) {
+        fprintf(stderr, "sub: %s still running after 10s -- 'sub stop --force %s' "
+                        "sends SIGKILL\n", who, who);
+        return 4;
     }
-    munmap(s, sizeof *s);
-    return rc;
+    printf("sub: SIGKILL -> %s\n", who);
+    kill(group ? -want : want, SIGKILL);
+    for (int i = 0; i < 20 && target_alive(want, group); i++) usleep(100000);
+    if (target_alive(want, group)) {
+        fprintf(stderr, "sub: %s survived SIGKILL (stuck in the kernel?)\n", who);
+        return 4;
+    }
+    printf("sub: %s killed\n", who);
+    return 0;
 }
 
 /* ---- sub run ---- */
@@ -189,6 +213,13 @@ static int do_run(int argc, char **argv) {
     pid_t kid = fork();
     if (kid < 0) { perror("sub: fork"); if (joined) sub_close(&C); return 1; }
     if (kid == 0) {
+        /* Its own process group, for two reasons. `sub stop` can then reach
+         * everything the service forked, not just its first pid -- without
+         * this, stopping `sh -c "worker & wait"` orphaned the worker to pid 1.
+         * And a Ctrl-C at the terminal no longer hits the child directly AND
+         * again via on_sig: the terminal signals the wrapper's group, which
+         * the child is no longer in, so it is told once. */
+        setpgid(0, 0);
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT,  SIG_DFL);
         signal(SIGHUP,  SIG_DFL);
@@ -196,6 +227,7 @@ static int do_run(int argc, char **argv) {
         fprintf(stderr, "sub: cannot exec %s: %s\n", argv[i], strerror(errno));
         _exit(127);
     }
+    setpgid(kid, kid);    /* both sides, so neither races the other */
     g_child = kid;
 
     /* The row must name the service, not its babysitter. Everything downstream
@@ -222,8 +254,9 @@ static int usage(void) {
       "        Exits with the child's exit code.\n"
       "  sub ps\n"
       "        List every registered process. Registers nothing itself.\n"
-      "  sub stop NAME|PID\n"
-      "        SIGTERM one registered process and wait up to 10s for it.\n"
+      "  sub stop [--force] NAME|PID\n"
+      "        SIGTERM it and everything it forked, wait up to 10s.\n"
+      "        --force: SIGKILL whatever is left after that.\n"
       "\n"
       "The registry is the segment %s (format v%u), owned by sub-dbd.\n"
       "Start it with 'sub-dbd &' and stop it with 'sub-dbd --stop'.\n",
@@ -236,8 +269,12 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "ps"))   return do_ps();
     if (!strcmp(argv[1], "run"))  return do_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "stop")) {
-        if (argc < 3) { fprintf(stderr, "usage: sub stop NAME|PID\n"); return 2; }
-        return do_stop(argv[2]);
+        int force = argc > 2 && !strcmp(argv[2], "--force");
+        if (argc < 3 + force) {
+            fprintf(stderr, "usage: sub stop [--force] NAME|PID\n");
+            return 2;
+        }
+        return do_stop(argv[2 + force], force);
     }
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help"))
         return usage();

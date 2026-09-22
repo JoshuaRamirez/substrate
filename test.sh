@@ -462,6 +462,35 @@ kill -9 "$ZPID" 2>/dev/null; sleep 1
 check "a SIGKILLed service is reaped, unasked" \
       "$(./bin/sub ps | awk '$2=="zomb"{print $2}')" ""
 
+# A service is everything it forked. Before setpgid, stopping this orphaned
+# the worker to pid 1 and reported success.
+( ./bin/sub run --name tree -- sh -c 'sleep 300 & echo $! > /tmp/sub_gc; wait' >/dev/null 2>&1 & )
+sleep 1
+TPID=$(./bin/sub ps | awk '$2=="tree"{print $1}')
+check "the service leads its own process group" \
+      "$(ps -o pgid= -p "$TPID" | tr -d ' ')" "$TPID"
+check "and the wrapper is not in it, so a terminal ^C reaches it once" \
+      "$(ps -o pgid= -p "$(ps -o ppid= -p "$TPID" | tr -d ' ')" | tr -d ' ')" "$(ps -o pgid= -p $$ | tr -d ' ')"
+./bin/sub stop tree >/dev/null 2>&1
+sleep 0.3
+check "sub stop reaches what the service forked" \
+      "$(kill -0 "$(cat /tmp/sub_gc)" 2>/dev/null && echo orphaned || echo gone)" "gone"
+rm -f /tmp/sub_gc
+
+( ./bin/sub run --name deaf -- sh -c 'trap "" TERM; while :; do sleep 1; done' >/dev/null 2>&1 & )
+sleep 1
+./bin/sub stop deaf >/dev/null 2>&1
+check "a service that ignores SIGTERM is reported, not assumed stopped" "$?" "4"
+./bin/sub stop --force deaf >/dev/null 2>&1
+check "--force escalates to SIGKILL" "$?" "0"
+
+# A C peer that joined on its own shares this script's process group.
+# Signalling that group would kill the test suite.
+( ./bin/webd --join --port 8112 >/dev/null 2>&1 & )
+sleep 2
+./bin/sub stop webd >/dev/null 2>&1
+check "a non-leader is signalled alone, never its group" "$?" "0"
+
 ./bin/dbd --stop >/dev/null 2>&1
 pkill -f 'bin/sub run' 2>/dev/null
 echo
