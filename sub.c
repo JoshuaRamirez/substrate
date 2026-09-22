@@ -23,6 +23,12 @@
 #include "substrate.h"
 #include <sys/wait.h>
 #include <stdlib.h>
+#include <limits.h>
+#if defined(__APPLE__)
+#include <mach-o/dyld.h>
+#include <sys/stat.h>
+#include <dirent.h>
+#endif
 
 static substrate C;
 static pid_t g_child = 0;
@@ -166,13 +172,14 @@ static int do_stop(const char *who, int force) {
 
 static int do_run(int argc, char **argv) {
     const char *name = NULL, *role = "service";
-    int anyway = 0, i = 0;
+    int anyway = 0, i = 0, waitsec = 0;
 
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--")) { i++; break; }
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) role = argv[++i];
         else if (!strcmp(argv[i], "--anyway")) anyway = 1;
+        else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsec = atoi(argv[++i]);
         else { fprintf(stderr, "sub run: unknown option %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
@@ -190,8 +197,17 @@ static int do_run(int argc, char **argv) {
      * Probe with sub_attach first: it is the one attach that is contractually
      * silent (the dashboard polls it), so the failure here is reported once,
      * in this tool's words, instead of twice in two voices. */
+    /* launchd starts agents in no particular order, so a service can come up
+     * before the registry does. Waiting is not the same as not caring: it
+     * still refuses to run unregistered, it just gives the registry a window
+     * to appear first. */
     int err = 0, joined = 0;
-    sub_seg *probe = sub_attach(&err);
+    sub_seg *probe = NULL;
+    for (int t = 0; ; t++) {
+        probe = sub_attach(&err);
+        if (probe || t >= waitsec * 10) break;
+        usleep(100000);
+    }
     if (probe) {
         munmap(probe, sizeof *probe);
         joined = sub_open(&C, 1, name, role) == 0;
@@ -243,6 +259,284 @@ static int do_run(int argc, char **argv) {
     return WEXITSTATUS(st);
 }
 
+
+/* ---- launchd: making it come back after a reboot (macOS only) ---- */
+
+#if defined(__APPLE__)
+
+#define SUB_LABEL_PFX "dev.substrate."
+
+/* plist is XML. An unescaped & in someone's argument is a corrupt plist that
+ * launchd refuses with a message about the file, not about the argument. */
+static void xml_out(FILE *f, const char *t) {
+    for (; *t; t++) switch (*t) {
+        case '&':  fputs("&amp;",  f); break;
+        case '<':  fputs("&lt;",   f); break;
+        case '>':  fputs("&gt;",   f); break;
+        case '"':  fputs("&quot;", f); break;
+        case '\'': fputs("&apos;", f); break;
+        default:   fputc(*t, f);
+    }
+}
+
+static int self_path(char *out, size_t cap) {
+    uint32_t n = (uint32_t)cap;
+    if (_NSGetExecutablePath(out, &n) != 0) return -1;
+    char real[PATH_MAX];
+    if (realpath(out, real)) snprintf(out, cap, "%s", real);
+    return 0;
+}
+
+/* launchd hands an agent a minimal PATH and no shell, so "node" means nothing
+ * by the time the plist runs. Resolve it now, while a usable PATH exists. */
+static int which_abs(const char *cmd, char *out, size_t cap) {
+    if (strchr(cmd, '/')) {
+        if (!realpath(cmd, out)) return -1;
+        return access(out, X_OK);
+    }
+    const char *path = getenv("PATH");
+    if (!path) return -1;
+    char buf[PATH_MAX];
+    while (*path) {
+        size_t k = strcspn(path, ":");
+        if (k && k < sizeof buf) {
+            snprintf(buf, sizeof buf, "%.*s/%s", (int)k, path, cmd);
+            if (access(buf, X_OK) == 0) { snprintf(out, cap, "%s", buf); return 0; }
+        }
+        path += k + (path[k] == ':');
+    }
+    return -1;
+}
+
+static int run_cmd(char *const av[], int quiet) {
+    pid_t k = fork();
+    if (k < 0) return -1;
+    if (k == 0) {
+        if (quiet) {           /* "Boot-out failed: No such process" is the
+                                * normal case for something not yet loaded. */
+            int null = open("/dev/null", O_WRONLY);
+            if (null >= 0) { dup2(null, 1); dup2(null, 2); close(null); }
+        }
+        execvp(av[0], av); _exit(127);
+    }
+    int st = 0;
+    while (waitpid(k, &st, 0) < 0 && errno == EINTR) { }
+    return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static void agent_path(const char *name, char *out, size_t cap) {
+    snprintf(out, cap, "%s/Library/LaunchAgents/" SUB_LABEL_PFX "%s.plist",
+             getenv("HOME"), name);
+}
+
+static void logs_dir(char *out, size_t cap) {
+    snprintf(out, cap, "%s/Library/Logs/substrate", getenv("HOME"));
+}
+
+static int bootout(const char *label) {
+    char tgt[256], lc[] = "launchctl", verb[] = "bootout";
+    snprintf(tgt, sizeof tgt, "gui/%u/%s", getuid(), label);
+    char *const av[] = { lc, verb, tgt, NULL };
+    return run_cmd(av, 1);     /* absent is fine; bootstrap is what must work */
+}
+
+static int bootstrap(const char *plist) {
+    char tgt[64], lc[] = "launchctl", verb[] = "bootstrap", pl[PATH_MAX];
+    snprintf(tgt, sizeof tgt, "gui/%u", getuid());
+    snprintf(pl, sizeof pl, "%s", plist);
+    char *const av[] = { lc, verb, tgt, pl, NULL };
+    return run_cmd(av, 0);
+}
+
+/* Write a plist, atomically: launchd may be reading the directory. */
+static int write_plist(const char *name, char *const *args, int n, const char *wd) {
+    char path[PATH_MAX], tmp[PATH_MAX], logs[PATH_MAX];
+    agent_path(name, path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    logs_dir(logs, sizeof logs);
+    mkdir(logs, 0755);
+
+    FILE *f = fopen(tmp, "w");
+    if (!f) { fprintf(stderr, "sub: cannot write %s: %s\n", tmp, strerror(errno)); return -1; }
+    fputs("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+          "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" "
+          "\"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n"
+          "<plist version=\"1.0\">\n<dict>\n", f);
+    fputs("  <key>Label</key><string>" SUB_LABEL_PFX, f); xml_out(f, name); fputs("</string>\n", f);
+    fputs("  <key>ProgramArguments</key>\n  <array>\n", f);
+    for (int i = 0; i < n; i++) { fputs("    <string>", f); xml_out(f, args[i]); fputs("</string>\n", f); }
+    fputs("  </array>\n", f);
+    fputs("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n", f);
+    if (wd) { fputs("  <key>WorkingDirectory</key><string>", f); xml_out(f, wd); fputs("</string>\n", f); }
+    for (int i = 0; i < 2; i++) {
+        fprintf(f, "  <key>Standard%sPath</key><string>", i ? "Error" : "Out");
+        xml_out(f, logs); fputc('/', f); xml_out(f, name); fputs(".log</string>\n", f);
+    }
+    /* Give the agent the PATH this shell has. Without it, a service that
+     * shells out finds a four-entry PATH and fails in a confusing place. */
+    const char *pth = getenv("PATH");
+    if (pth) {
+        fputs("  <key>EnvironmentVariables</key><dict><key>PATH</key><string>", f);
+        xml_out(f, pth); fputs("</string></dict>\n", f);
+    }
+    fputs("</dict>\n</plist>\n", f);
+    if (fclose(f) != 0) { unlink(tmp); return -1; }
+    if (rename(tmp, path) != 0) { unlink(tmp); return -1; }
+    return 0;
+}
+
+/* The registry is what every other agent needs, and launchd will not order
+ * them -- so enabling anything ensures it, rather than leaving a step the
+ * user finds out about only after a reboot. */
+static int ensure_registry(void) {
+    char plist[PATH_MAX];
+    agent_path("registry", plist, sizeof plist);
+    if (access(plist, F_OK) == 0) return 0;
+
+    char me[PATH_MAX], dbd[PATH_MAX];
+    if (self_path(me, sizeof me) < 0) return -1;
+    snprintf(dbd, sizeof dbd, "%s-dbd", me);
+    if (access(dbd, X_OK) != 0) {
+        fprintf(stderr, "sub: cannot find sub-dbd next to %s\n", me);
+        return -1;
+    }
+    char *const args[] = { dbd, NULL };
+    if (write_plist("registry", args, 1, NULL) < 0) return -1;
+    bootout(SUB_LABEL_PFX "registry");
+    if (bootstrap(plist) != 0) {
+        fprintf(stderr, "sub: launchctl could not load the registry agent\n");
+        return -1;
+    }
+    printf("sub: registry agent enabled (" SUB_LABEL_PFX "registry)\n");
+    return 0;
+}
+
+static int do_enable(int argc, char **argv) {
+    const char *name = NULL, *role = "service", *dir = NULL;
+    int i = 0, waitsec = 60, want_registry = 1;
+    for (i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--")) { i++; break; }
+        else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
+        else if (!strcmp(argv[i], "--role") && i + 1 < argc) role = argv[++i];
+        else if (!strcmp(argv[i], "--dir")  && i + 1 < argc) dir  = argv[++i];
+        else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--no-registry")) want_registry = 0;
+        else { fprintf(stderr, "sub enable: unknown option %s\n", argv[i]); return 2; }
+    }
+    if (i >= argc) {
+        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] -- cmd [args]\n");
+        return 2;
+    }
+    if (!name) name = base_of(argv[i]);
+    if (strchr(name, '/')) { fprintf(stderr, "sub: a name cannot contain '/'\n"); return 2; }
+
+    char me[PATH_MAX], cmd[PATH_MAX], cwd[PATH_MAX], ws[16];
+    if (self_path(me, sizeof me) < 0) { fprintf(stderr, "sub: cannot find my own path\n"); return 1; }
+    if (which_abs(argv[i], cmd, sizeof cmd) != 0) {
+        fprintf(stderr, "sub: cannot find '%s' on PATH -- launchd will not either\n", argv[i]);
+        return 2;
+    }
+    if (!dir) dir = getcwd(cwd, sizeof cwd);
+    snprintf(ws, sizeof ws, "%d", waitsec);
+
+    /* sub run is what launchd supervises: it registers the child, forwards
+     * signals to its group, and exits with the child's exit code, which is
+     * exactly the contract KeepAlive wants. */
+    char v_run[] = "run", v_name[] = "--name", v_role[] = "--role",
+         v_wait[] = "--wait", v_end[] = "--";
+    char nm[SUB_NAMELEN * 4], rl[SUB_NAMELEN * 4];
+    snprintf(nm, sizeof nm, "%s", name);
+    snprintf(rl, sizeof rl, "%s", role);
+    char *args[64];
+    int n = 0;
+    args[n++] = me;
+    args[n++] = v_run;
+    args[n++] = v_name; args[n++] = nm;
+    args[n++] = v_role; args[n++] = rl;
+    args[n++] = v_wait; args[n++] = ws;
+    args[n++] = v_end;
+    args[n++] = cmd;
+    for (int k = i + 1; k < argc && n < 63; k++) args[n++] = argv[k];
+    args[n] = NULL;
+
+    if (want_registry && ensure_registry() < 0) return 1;
+
+    char plist[PATH_MAX], label[256];
+    agent_path(name, plist, sizeof plist);
+    snprintf(label, sizeof label, SUB_LABEL_PFX "%s", name);
+    if (write_plist(name, args, n, dir) < 0) return 1;
+    bootout(label);                       /* re-enabling is allowed */
+    if (bootstrap(plist) != 0) {
+        fprintf(stderr, "sub: launchctl could not load %s\n", plist);
+        return 1;
+    }
+    printf("sub: %s enabled -- starts at login, restarts if it exits\n", name);
+    printf("     plist %s\n", plist);
+    printf("     log   %s/Library/Logs/substrate/%s.log\n", getenv("HOME"), name);
+    return 0;
+}
+
+static int do_disable(const char *name) {
+    char plist[PATH_MAX], label[256];
+    agent_path(name, plist, sizeof plist);
+    snprintf(label, sizeof label, SUB_LABEL_PFX "%s", name);
+    if (access(plist, F_OK) != 0) {
+        fprintf(stderr, "sub: %s is not enabled\n", name);
+        return 2;
+    }
+    bootout(label);
+    if (unlink(plist) != 0) { perror("sub: unlink"); return 1; }
+    printf("sub: %s disabled and removed from login\n", name);
+    return 0;
+}
+
+static int do_enabled(void) {
+    char dir[PATH_MAX];
+    snprintf(dir, sizeof dir, "%s/Library/LaunchAgents", getenv("HOME"));
+    DIR *d = opendir(dir);
+    if (!d) { perror("sub: opendir"); return 1; }
+    struct dirent *e;
+    int n = 0;
+    size_t pfx = strlen(SUB_LABEL_PFX);
+    while ((e = readdir(d))) {
+        if (strncmp(e->d_name, SUB_LABEL_PFX, pfx)) continue;
+        const char *dot = strrchr(e->d_name, '.');
+        if (!dot || strcmp(dot, ".plist")) continue;
+        char nm[128], label[256], tgt[320];
+        snprintf(nm, sizeof nm, "%.*s", (int)(dot - e->d_name) - (int)pfx, e->d_name + pfx);
+        snprintf(label, sizeof label, SUB_LABEL_PFX "%s", nm);
+        snprintf(tgt, sizeof tgt, "gui/%u/%s", getuid(), label);
+        char lc[] = "launchctl", verb[] = "print";
+        char *const av[] = { lc, verb, tgt, NULL };
+        int loaded = run_cmd(av, 1) == 0;
+        if (!n++) printf("%-20s  %s\n", "NAME", "STATE");
+        printf("%-20s  %s\n", nm, loaded ? "loaded" : "not loaded");
+    }
+    closedir(d);
+    if (!n) printf("(nothing enabled at login)\n");
+    return 0;
+}
+
+#else   /* not macOS */
+
+static int do_enable(int argc, char **argv) {
+    (void)argc; (void)argv;
+    fprintf(stderr, "sub: enable needs launchd, which is macOS only.\n"
+                    "     On Linux, wrap 'sub run' in a systemd user unit.\n");
+    return 2;
+}
+static int do_disable(const char *name) {
+    (void)name;
+    fprintf(stderr, "sub: enable/disable need launchd, which is macOS only.\n");
+    return 2;
+}
+static int do_enabled(void) {
+    fprintf(stderr, "sub: enable/disable need launchd, which is macOS only.\n");
+    return 2;
+}
+
+#endif
+
 static int usage(void) {
     printf(
       "sub -- register and manage the things you run on this machine\n"
@@ -254,6 +548,15 @@ static int usage(void) {
       "        Exits with the child's exit code.\n"
       "  sub ps\n"
       "        List every registered process. Registers nothing itself.\n"
+      "  sub enable [--name N] [--role R] [--dir D] -- cmd [args...]\n"
+      "        Same as run, but at login and restarted if it exits, via a\n"
+      "        launchd agent. Also enables the registry itself, unless you\n"
+      "        pass --no-registry because you start it some other way.\n"
+      "        macOS only.\n"
+      "  sub disable NAME\n"
+      "        Stop it starting at login and remove its agent.\n"
+      "  sub enabled\n"
+      "        List what is set to start at login.\n"
       "  sub stop [--force] NAME|PID\n"
       "        SIGTERM it and everything it forked, wait up to 10s.\n"
       "        --force: SIGKILL whatever is left after that.\n"
@@ -268,6 +571,12 @@ int main(int argc, char **argv) {
     if (argc < 2) return usage();
     if (!strcmp(argv[1], "ps"))   return do_ps();
     if (!strcmp(argv[1], "run"))  return do_run(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "enable"))  return do_enable(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "enabled")) return do_enabled();
+    if (!strcmp(argv[1], "disable")) {
+        if (argc < 3) { fprintf(stderr, "usage: sub disable NAME\n"); return 2; }
+        return do_disable(argv[2]);
+    }
     if (!strcmp(argv[1], "stop")) {
         int force = argc > 2 && !strcmp(argv[2], "--force");
         if (argc < 3 + force) {

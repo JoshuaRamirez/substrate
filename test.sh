@@ -31,6 +31,26 @@ else
 fi
 [ -x ./bin/gui ] || echo "  (no Cocoa here: gui/top checks run against bin/peer)"
 
+# A registry enabled at login is supervised by launchd, which restarts it the
+# instant this suite kills it -- so the suite would measure a segment it does
+# not control and fail ~30 checks for reasons that are not bugs. Stand it down
+# for the duration, and put it back however this script exits.
+LD_REG="dev.substrate.registry"
+LD_WAS=0
+if command -v launchctl >/dev/null 2>&1 && \
+   launchctl print "gui/$(id -u)/$LD_REG" >/dev/null 2>&1; then
+  echo "  (standing down the launchd registry agent for the duration)"
+  launchctl bootout "gui/$(id -u)/$LD_REG" >/dev/null 2>&1
+  LD_WAS=1
+  sleep 0.5
+fi
+restore_agent() {
+  [ "$LD_WAS" = "1" ] || return 0
+  launchctl bootstrap "gui/$(id -u)" \
+    "$HOME/Library/LaunchAgents/$LD_REG.plist" >/dev/null 2>&1
+}
+trap 'restore_agent' EXIT INT TERM
+
 pkill -f 'bin/(dbd|webd)' 2>/dev/null
 rm -f substrate.db; sleep 0.3
 
@@ -493,6 +513,59 @@ check "a non-leader is signalled alone, never its group" "$?" "0"
 
 ./bin/dbd --stop >/dev/null 2>&1
 pkill -f 'bin/sub run' 2>/dev/null
+echo
+
+# launchd is how this comes back after a reboot. The plist is the artifact,
+# so the plist is what gets checked: everything launchd will not tell you
+# until the next login.
+echo "22. surviving a reboot: the launchd agent it writes"
+if [ ! -x ./bin/gui ]; then
+  skip "launchd is macOS only (enable/disable/enabled refuse elsewhere)"
+  ./bin/sub enable --name x -- true >/dev/null 2>&1
+  check "enable refuses where there is no launchd" "$?" "2"
+else
+  # A throwaway HOME, so a test never touches the real LaunchAgents dir, and
+  # --no-registry so it never bounces a registry agent the user is relying on.
+  TH=$(mktemp -d); mkdir -p "$TH/Library/LaunchAgents"
+  PL="$TH/Library/LaunchAgents/dev.substrate.subci.plist"
+  HOME="$TH" ./bin/sub enable --no-registry --name subci --dir /tmp -- sleep 600 >/dev/null 2>&1
+  check "enable writes an agent plist" "$([ -f "$PL" ] && echo yes || echo no)" "yes"
+  check "and it is valid plist XML" "$(plutil -lint "$PL" >/dev/null 2>&1 && echo ok || echo bad)" "ok"
+
+  g(){ plutil -extract "$1" raw -o - "$PL" 2>/dev/null; }
+  # -extract on an array yields its COUNT, not its contents, so go via json.
+  PA(){ plutil -convert json -o - "$1" | python3 -c \
+        'import json,sys; print("\n".join(json.load(sys.stdin)["ProgramArguments"]))'; }
+  check "it runs sub, by absolute path"  "$(g ProgramArguments.0)" "$(cd "$(dirname ./bin/sub)" && pwd)/sub"
+  check "it supervises 'sub run'"        "$(g ProgramArguments.1)" "run"
+  check "it waits for the registry, because launchd will not order them" \
+        "$(PA "$PL" | grep -c -- '--wait')" "1"
+  # launchd gives an agent a minimal PATH, so "sleep" must already be resolved.
+  check "the command is resolved to an absolute path" \
+        "$(PA "$PL" | grep -c '^/.*/sleep$')" "1"
+  check "it starts at login"             "$(g RunAtLoad)"  "true"
+  check "and restarts if it exits"       "$(g KeepAlive)"  "true"
+  check "it runs where you enabled it"   "$(g WorkingDirectory)" "/tmp"
+
+  # A plist is XML. An unescaped & in an argument is a file launchd rejects.
+  HOME="$TH" ./bin/sub enable --no-registry --name subxml -- sh -c 'echo a&b<c>"d"' >/dev/null 2>&1
+  PLX="$TH/Library/LaunchAgents/dev.substrate.subxml.plist"
+  check "an argument with XML metacharacters still lints" \
+        "$(plutil -lint "$PLX" >/dev/null 2>&1 && echo ok || echo bad)" "ok"
+  check "and survives the round trip unchanged" \
+        "$(PA "$PLX" | tail -1)" 'echo a&b<c>"d"'
+
+  check "enabled lists them" \
+        "$(HOME="$TH" ./bin/sub enabled | awk '$1=="subci"||$1=="subxml"' | wc -l | tr -d ' ')" "2"
+  HOME="$TH" ./bin/sub disable subci >/dev/null 2>&1
+  check "disable removes the agent" "$([ -f "$PL" ] && echo still || echo gone)" "gone"
+  HOME="$TH" ./bin/sub disable subci >/dev/null 2>&1
+  check "disabling what is not enabled says so" "$?" "2"
+
+  launchctl bootout "gui/$(id -u)/dev.substrate.subci"  2>/dev/null
+  launchctl bootout "gui/$(id -u)/dev.substrate.subxml" 2>/dev/null
+  rm -rf "$TH"
+fi
 echo
 
 rm -f substrate.db

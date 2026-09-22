@@ -142,11 +142,47 @@ Nothing here changes the format. `sub` reads and writes only fields v8 already
 had, which is why `pypeer.py` and `swiftpeer.swift` keep working without being
 told anything.
 
-**What it is not.** This is a registry, not a supervisor. It does not restart
-anything, collect logs, order startup, or survive a reboot. `sub run` stays in
-the foreground and exits with its child's exit code — which is exactly what
-`launchd` wants to supervise, so put `sub run` inside a plist rather than
-teaching it to daemonize.
+### Surviving a reboot
+
+`sub run` in a terminal dies with the terminal. `sub enable` writes a launchd
+agent instead, so the service starts at login and is restarted if it exits:
+
+```sh
+sub enable --name api --role http:8099 -- node server.js
+sub enabled
+sub disable api
+```
+
+It writes `~/Library/LaunchAgents/dev.substrate.<name>.plist`, logs to
+`~/Library/Logs/substrate/<name>.log`, and enables the registry's own agent
+the first time, so there is no separate step you discover you missed after a
+reboot. No `sudo`: these are user agents, not system daemons.
+
+Three things it does at enable time, because launchd will not do them for you:
+
+- **Resolves your command to an absolute path.** launchd gives an agent a
+  minimal `PATH` and no shell, so `node` means nothing by the time the plist
+  runs. It also copies your current `PATH` into the agent, for services that
+  shell out.
+- **Passes `--wait 60` to `sub run`.** launchd does not order agents, so a
+  service can start before the registry does. Waiting is not the same as not
+  caring — it still refuses to run unregistered, it just gives the registry a
+  window to appear. Tested by starting a service agent first, with no registry,
+  and bootstrapping the registry three seconds later: the service registers.
+- **Escapes your arguments.** A plist is XML, and an unescaped `&` is a file
+  launchd rejects with a message about the file rather than the argument.
+
+**If you enable the registry at login, `./test.sh` stands it down for the
+duration and puts it back on exit.** launchd restarts a supervised `sub-dbd`
+the instant the suite kills it, and the suite would then be measuring a
+segment it does not control. That was ~30 cascading failures before the
+suite learned to check.
+
+**What it is still not.** A supervisor with policy. It does not order your
+services relative to each other, back off on crash loops beyond launchd's own
+10-second throttle, rotate logs, or do health checks. And `enable` is macOS
+only — on Linux it refuses and points at systemd user units, which are not
+written.
 
 ## Uninstall it
 
