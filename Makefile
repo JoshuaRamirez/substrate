@@ -64,7 +64,6 @@ endif
 .PHONY: all test check san run clean distclean install uninstall purge stop help
 
 all: $(PROGS) $(FIXTURES) $(SWIFT)
-	@rm -f bin/.sanitized
 	@echo "built:"
 	@ls -lh $(PROGS) $(SWIFT) 2>/dev/null | awk '{printf "  %-16s %s\n", $$9, $$5}'
 
@@ -107,16 +106,17 @@ bin/top: top.m substrate.h | bin
 bin/swiftpeer: swiftpeer.swift | bin
 	@swiftc -O $< -o $@ 2>/dev/null || echo "  (swiftpeer skipped: swiftc failed)"
 
-# The marker lets test.sh know the binaries are instrumented. ASan makes the
-# owner roughly an order of magnitude slower, and the call timeout is measured
-# on a wall clock -- so at high client counts, timeouts here are the system
-# working, not failing. test.sh checks the weaker (and correct) invariant.
+# ASan makes the owner roughly an order of magnitude slower, and the call
+# timeout is measured on a wall clock, so timeouts at high client counts are
+# the system working rather than failing. This used to touch bin/.sanitized so
+# test.sh could relax its checks here -- but a release build on a small CI
+# runner times out for the same reason, so the suite now keys off whether
+# timeouts actually happened, and the marker is gone.
 san:
 	@$(MAKE) --no-print-directory clean
 	@$(MAKE) --no-print-directory \
 	   OPT="-O1 -g -fsanitize=address,undefined -fno-omit-frame-pointer" all
-	@touch bin/.sanitized
-	@echo "  (instrumented: bin/.sanitized)"
+	@echo "  (instrumented: ASan + UBSan)"
 
 test: all
 	./test.sh

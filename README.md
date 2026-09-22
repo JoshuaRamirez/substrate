@@ -566,6 +566,7 @@ Run `make test`.
 | The shared cell needs a lock, and the lock needs a protocol | **not falsified** — see below |
 | A reply-carrying verb forces a ring, and the ring breaks the one-pointer property | **not falsified** — the ring exists, `sub_reserve` needs it, and the call site still does not change |
 | A second language cannot join without a C shim | **not falsified** — Swift and Python both join on the format alone |
+| A process cannot be brought back after a reboot without a supervisor daemon | **not falsified** — `sub enable` writes a launchd agent; launchd is already the supervisor |
 | Registering a process in the table means putting an agent inside it | **not falsified** — `sub run` claims the row on the child's behalf, and the OS answers liveness |
 
 The fourth one fired, and it is worth being exact about how.
