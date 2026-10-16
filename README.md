@@ -37,6 +37,18 @@ process is gone, because `dbd` is the owner.
 
 Each row has a `stop` button, which is a `SIGTERM` to that pid.
 
+The headline is live peers, of registered (the demo counter sits in the line
+under the title). UP, CPU and MEM are the OS's for that pid (libproc), so UP is
+the process's own age, not the row's claim time, which a re-join after a
+registry restart resets for every row at once. The table is a native scroll
+view and the columns size to their content. Under the live rows, greyed, is
+every job `sub enable` set to start at login that has no live row right now: a
+timer between ticks with its next run (`next 13:40`, `next Fri 07:40`,
+`every 5m`), a service that is `down`, a login app `at login`. Those rows are
+read from `~/Library/LaunchAgents/dev.substrate.*.plist` (`SUB_AGENTS` in a
+test); `sub-top --next-run <plist>` prints one job's line, and `SUB_NOW` pins
+the clock, which is how the suite checks the schedule reading.
+
 The registry needs no lock and no protocol for the same reason the count
 needs none, but by a different route: **ownership is partitioned.** Each
 process is the only writer of its own row. Claiming a free row is one
@@ -110,6 +122,9 @@ PID       NAME             ROLE             UP         OPS
 53060     worker           queue            2m01s      0
 
 3 registered
+```
+
+UP is each process's own age (libproc on macOS; the row's claim time elsewhere).
 ```
 
 Three details that are easy to get backwards, and are tested:
