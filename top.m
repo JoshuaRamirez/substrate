@@ -12,7 +12,11 @@
  * the table: one row per registered peer, then one greyed row per job that is
  * enabled at login (~/Library/LaunchAgents/dev.substrate.*.plist, SUB_AGENTS
  * in a test) but has no live row right now -- a timer between ticks, with its
- * next run; a service that is down. Columns size to their content.
+ * next run; a service that is down. Columns size to their content. A click on
+ * a column header sorts the table by it, a second click reverses it; live rows
+ * stay above the greyed ones and the sort applies within each group. Numbers
+ * sort as numbers, UP by age. The choice is kept in a file, so it holds
+ * through refreshes and restarts.
  *
  * It also shows where the owner persists, and can move it: the panel writes a
  * path into the same page, and dbd acts on it. The dashboard does not talk to
@@ -62,11 +66,15 @@ static NSString *age_str(long s) {
 
 /* UP is the process's own age (the OS says when it started); the row's claim
  * time is the fallback, for a pid the OS will not describe. */
-static NSString *uptime_str(pid_t pid, uint64_t since) {
+static long uptime_secs(pid_t pid, uint64_t since) {    /* -1 when nobody can say */
     uint64_t start = sub_proc_start(pid);
     if (!start) start = since;
-    if (!start) return @"-";
-    return age_str((long)(time(NULL) - (time_t)start));
+    if (!start) return -1;
+    return (long)(time(NULL) - (time_t)start);
+}
+
+static NSString *uptime_str(long secs) {
+    return secs < 0 ? @"-" : age_str(secs);
 }
 
 static NSString *mem_str(uint64_t b) {
@@ -172,6 +180,16 @@ static time_t next_calendar(const sub_job *j, time_t from) {
         }
     }
     return best;
+}
+
+/* How far off a job's next run is, for the UP sort of the greyed rows: a
+ * timer's seconds to its next fire (or its period), a down service 0 (it is
+ * due now), a login app LONG_MAX (it waits for a login, not a clock). */
+static long idle_secs(const sub_job *j, time_t from) {
+    if (j->ncal) { time_t n = next_calendar(j, from); return n ? (long)(n - from) : LONG_MAX - 1; }
+    if (j->every) return j->every;
+    if (j->keepalive) return 0;
+    return LONG_MAX;
 }
 
 /* What the UP column says for a job with no live row. */
@@ -299,9 +317,77 @@ static const char *COLH[NCOL] = { "NAME", "ROLE", "PID", "UP", "CPU", "MEM" };
 
 typedef struct {
     NSString *cell[NCOL];
+    NSString *name;             /* the bare name: the NAME sort key, and what --render lists */
+    long long num[NCOL];        /* the numeric key where the column is a number: PID, UP (seconds), CPU (ns), MEM (bytes) */
     int alive, me, idle, slot;
     pid_t pid;
 } row_t;
+
+/* The sort: which column, which way. -1 is the registry's own order (slots,
+ * then the plists by name). Kept in a file (SUB_TOP_SORT, else
+ * ~/Library/Application Support/substrate/top-sort) so it holds through a
+ * restart; a --sort flag sets it for one run without writing. */
+static int g_sort_col = -1, g_sort_desc = 0;
+
+static NSString *sort_path(void) {
+    const char *e = getenv("SUB_TOP_SORT");
+    if (e && *e) return [NSString stringWithUTF8String:e];
+    return [NSHomeDirectory() stringByAppendingPathComponent:@"Library/Application Support/substrate/top-sort"];
+}
+
+static int col_named(const char *name, size_t len) {
+    for (int c = 0; c < NCOL; c++)
+        if (strlen(COLH[c]) == len && !strncasecmp(COLH[c], name, len)) return c;
+    return -1;
+}
+
+/* "NAME asc" / "PID desc"; anything else is no sort. */
+static void sort_parse(const char *line) {
+    g_sort_col = -1; g_sort_desc = 0;
+    if (!line) return;
+    const char *sp = strpbrk(line, " \t\n+-");
+    int c = col_named(line, sp ? (size_t)(sp - line) : strlen(line));
+    if (c < 0) return;
+    g_sort_col = c;
+    g_sort_desc = sp && (*sp == '-' || !strncasecmp(sp + strspn(sp, " \t"), "desc", 4));
+}
+
+static void sort_load(void) {
+    NSString *t = [NSString stringWithContentsOfFile:sort_path() encoding:NSUTF8StringEncoding error:nil];
+    sort_parse([t UTF8String]);
+}
+
+static void sort_save(void) {
+    NSString *p = sort_path();
+    [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent] withIntermediateDirectories:YES attributes:nil error:nil];
+    NSString *t = g_sort_col < 0 ? @"none\n" : [NSString stringWithFormat:@"%s %s\n", COLH[g_sort_col], g_sort_desc ? "desc" : "asc"];
+    [t writeToFile:p atomically:YES encoding:NSUTF8StringEncoding error:nil];
+}
+
+/* A click on a header: that column ascending, or the other way if it already was. */
+static void sort_press(int c) {
+    if (c == g_sort_col) g_sort_desc = !g_sort_desc;
+    else { g_sort_col = c; g_sort_desc = 0; }
+    sort_save();
+}
+
+static NSString *head_text(int c) {
+    if (c != g_sort_col) return [NSString stringWithUTF8String:COLH[c]];
+    return [NSString stringWithFormat:@"%s %@", COLH[c], g_sort_desc ? @"\u25bc" : @"\u25b2"];   /* %@: a %s would read the arrow's bytes as MacRoman */
+}
+
+/* Within a group. Numbers as numbers, names as Finder sorts them (webd2 before
+ * webd10), ties by name then slot so the order is stable frame to frame. */
+static int row_cmp(const void *a, const void *b) {
+    const row_t *x = a, *y = b;
+    int r = 0, c = g_sort_col;
+    if (c == C_NAME || c == C_ROLE) r = (int)[c == C_NAME ? x->name : x->cell[c] localizedStandardCompare:(c == C_NAME ? y->name : y->cell[c])];
+    else if (c >= 0) r = x->num[c] < y->num[c] ? -1 : x->num[c] > y->num[c] ? 1 : 0;
+    if (g_sort_desc) r = -r;
+    if (!r) r = (int)[x->name localizedStandardCompare:y->name];
+    if (!r) r = x->slot - y->slot;
+    return r;
+}
 
 /* The model: built on the tick, drawn on the frame. Nothing in drawRect:
  * reads the segment, the plists or the OS, and nothing in it changes
@@ -309,8 +395,9 @@ typedef struct {
  * (card 2326): the frame was set from inside drawRect:, while the layer was
  * being displayed. */
 static row_t   g_rows[SUB_MAX_PEERS + MAX_IDLE];
-static int     g_nrows = 0;
+static int     g_nrows = 0, g_nreg = 0;   /* rows, and how many of them are registered (the live group; the idle group follows) */
 static CGFloat g_colx[NCOL];
+static NSRect  g_head[NCOL];              /* header hit boxes, built with the columns on the tick */
 
 @interface TopView : NSView
 - (void)attachIfNeeded;
@@ -349,14 +436,18 @@ static CGFloat g_colx[NCOL];
         r->pid = (pid_t)atomic_load(&p->pid);
         r->alive = sub_peer_alive(p); r->me = (SELF && p == SELF); r->idle = 0; r->slot = i;
         uint64_t rss, cpu; sub_proc_cost(r->pid, &rss, &cpu);
-        r->cell[C_NAME] = r->me ? [NSString stringWithFormat:@"%s *", p->name] : [NSString stringWithUTF8String:p->name];
+        long up = uptime_secs(r->pid, atomic_load(&p->since));
+        r->name = [NSString stringWithUTF8String:p->name];
+        r->cell[C_NAME] = r->me ? [NSString stringWithFormat:@"%s *", p->name] : r->name;
         r->cell[C_ROLE] = [NSString stringWithUTF8String:p->role];
         r->cell[C_PID]  = [NSString stringWithFormat:@"%d", r->pid];
-        r->cell[C_UP]   = uptime_str(r->pid, atomic_load(&p->since));
+        r->cell[C_UP]   = uptime_str(up);
         r->cell[C_CPU]  = cpu_str(cpu);
         r->cell[C_MEM]  = mem_str(rss);
+        r->num[C_PID] = r->pid; r->num[C_UP] = up; r->num[C_CPU] = (long long)cpu; r->num[C_MEM] = (long long)rss;
         if (r->alive && nlive < SUB_MAX_PEERS) snprintf(live_names[nlive++], SUB_NAMELEN, "%s", p->name);
     }
+    int nreg = n;
     static sub_job jobs[MAX_IDLE];
     int nj = read_jobs(jobs, MAX_IDLE);
     time_t from = now_s();
@@ -365,14 +456,21 @@ static CGFloat g_colx[NCOL];
         for (int l = 0; l < nlive; l++) if (!strcmp(live_names[l], jobs[k].name)) { seen = 1; break; }
         if (seen) continue;
         row_t *r = &rows[n++];
-        r->pid = 0; r->alive = 0; r->me = 0; r->idle = 1; r->slot = -1;
-        r->cell[C_NAME] = [NSString stringWithUTF8String:jobs[k].name];
+        r->pid = 0; r->alive = 0; r->me = 0; r->idle = 1; r->slot = k;
+        r->name = [NSString stringWithUTF8String:jobs[k].name];
+        r->cell[C_NAME] = r->name;
         r->cell[C_ROLE] = [NSString stringWithUTF8String:jobs[k].role];
         r->cell[C_PID]  = @"-";
         r->cell[C_UP]   = idle_str(&jobs[k], from);
         r->cell[C_CPU]  = @"-";
         r->cell[C_MEM]  = @"-";
+        r->num[C_PID] = 0; r->num[C_UP] = idle_secs(&jobs[k], from); r->num[C_CPU] = 0; r->num[C_MEM] = 0;
     }
+    if (g_sort_col >= 0) {                  /* within each group; the live group stays above the idle one */
+        qsort(rows, (size_t)nreg, sizeof *rows, row_cmp);
+        qsort(rows + nreg, (size_t)(n - nreg), sizeof *rows, row_cmp);
+    }
+    g_nreg = nreg;
     return n;
 }
 
@@ -384,12 +482,12 @@ static CGFloat g_colx[NCOL];
     NSDictionary *cell = [self mono:12 white:0.55], *hd = [self mono:10 white:0.38];
     CGFloat cx = PAD + 22;
     for (int c = 0; c < NCOL; c++) {                      /* columns size to their content: the widest cell or header in each */
-        CGFloat colw = [[NSString stringWithUTF8String:COLH[c]] sizeWithAttributes:hd].width;
+        CGFloat colw = [head_text(c) sizeWithAttributes:hd].width;
         for (int i = 0; i < g_nrows; i++) {
             CGFloat w = [g_rows[i].cell[c] sizeWithAttributes:cell].width;
             if (w > colw) colw = w;
         }
-        g_colx[c] = cx; cx += colw + GAP;
+        g_colx[c] = cx; g_head[c] = NSMakeRect(cx - 6, 0, colw + GAP - 4, 26); cx += colw + GAP;
     }
     [self fitRows:g_nrows];
     [self setNeedsDisplay:YES];
@@ -414,8 +512,9 @@ static CGFloat g_colx[NCOL];
     row_t *rows = g_rows; int n = g_nrows; CGFloat *x = g_colx;
     NSDictionary *hd = [self mono:10 white:0.38];
     CGFloat y = 6;
+    NSDictionary *hs = [self mono:10 white:0.80];           /* the sorted column's header reads brighter, with its arrow */
     for (int c = 0; c < NCOL; c++)
-        [[NSString stringWithUTF8String:COLH[c]] drawAtPoint:NSMakePoint(x[c], y) withAttributes:hd];
+        [head_text(c) drawAtPoint:NSMakePoint(x[c], y) withAttributes:(c == g_sort_col ? hs : hd)];
     [[NSColor colorWithCalibratedWhite:0.20 alpha:1.0] setFill];
     NSRectFill(NSMakeRect(PAD, y + 18, W - 2 * PAD, 1));
 
@@ -473,6 +572,9 @@ static CGFloat g_colx[NCOL];
 
 - (void)mouseDown:(NSEvent *)e {
     NSPoint pt = [self convertPoint:e.locationInWindow fromView:nil];
+    if (SEG)
+        for (int c = 0; c < NCOL; c++)
+            if (NSPointInRect(pt, g_head[c])) { sort_press(c); [self reload]; return; }   /* reload: the model and the frame, outside any draw */   /* reload: the model and the frame, outside any draw */
     for (int i = 0; i < g_stop_n; i++) {
         if (NSPointInRect(pt, g_stop[i])) {
             /* The row could have been reaped between the frame that drew this
@@ -527,10 +629,23 @@ static int selftest(void) {
  * resized while its layer is being displayed, which AppKit may refuse with an
  * exception it then crashes on (+[NSApplication _crashOnException:]). So the
  * frame must already fit the rows before the draw, and be the same after. */
+/* --press COL (repeatable, before --render): a mouseDown at that header's own
+ * hit box, handed to the view as an NSEvent object. Nothing is posted to the
+ * window server; no pointer moves. It is how the suite proves that a click
+ * sorts and a second one reverses, through the same method a real click reaches. */
+static int g_press[NCOL * 4], g_npress = 0;
+
 static int render(const char *png) {
     NSRect fr = NSMakeRect(0, 0, 760, 456);
     TopView *v = [[TopView alloc] initWithFrame:fr];
     [v reload];                                  /* what the tick does: attach, rows, columns, the frame */
+    for (int k = 0; k < g_npress; k++) {
+        /* With no window, convertPoint:fromView:nil flips y against the frame; hand it the point that lands on the box. */
+        NSPoint at = NSMakePoint(NSMidX(g_head[g_press[k]]), v.frame.size.height - NSMidY(g_head[g_press[k]]));
+        NSEvent *e = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDown location:at modifierFlags:0 timestamp:0
+                                    windowNumber:0 context:nil eventNumber:0 clickCount:1 pressure:1];
+        [v mouseDown:e];
+    }
     int n = g_nrows;
     CGFloat want = 6 + 26 + n * ROW_H + 40;
     CGFloat before = v.frame.size.height;
@@ -542,11 +657,27 @@ static int render(const char *png) {
     CGFloat after = v.frame.size.height;
     if (png && *png) [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:png] atomically:YES];
     printf("top render: rows=%d want=%.0f before=%.0f after=%.0f ok=%d\n", n, want, before, after, before == want && after == want);
+    if (g_sort_col < 0) printf("top sort: none\n");
+    else printf("top sort: %s %s\n", COLH[g_sort_col], g_sort_desc ? "desc" : "asc");
+    printf("top order:");
+    for (int i = 0; i < n; i++) printf("%s%s", i == g_nreg ? " |" : "", [[@" " stringByAppendingString:g_rows[i].name] UTF8String]);
+    printf("\ntop head:");
+    for (int c = 0; c < NCOL; c++) printf(" %s", [head_text(c) UTF8String]);
+    printf("\n");
+    if (SELF) sub_release_slot(SELF);           /* a render leaves no row behind for the owner to reap */
     return 0;
 }
 
 int main(int argc, const char **argv) {
+    sort_load();
     for (int i = 1; i < argc; i++) {
+        if (!strcmp(argv[i], "--sort") && i + 1 < argc) { sort_parse(argv[++i]); continue; }   /* NAME, PID-, "UP desc": this run only */
+        if (!strcmp(argv[i], "--press") && i + 1 < argc) {                                      /* a header click, in-process; see render() */
+            int c = col_named(argv[i + 1], strlen(argv[i + 1]));
+            if (c < 0) { fprintf(stderr, "no column %s\n", argv[i + 1]); return 2; }
+            if (g_npress < NCOL * 4) g_press[g_npress++] = c;
+            i++; continue;
+        }
         if (!strcmp(argv[i], "--token")) {
             /* Not a leak: anything that can run this can already map the
              * segment and write every value in it. This just spells the

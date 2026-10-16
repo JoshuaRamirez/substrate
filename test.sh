@@ -147,7 +147,7 @@ if [ -x ./bin/top ]; then
   check "one press on NAME sorts by name, ascending"         "$(printf %s "$O" | grep '^top sort:')"  "top sort: NAME asc"
   check "live rows by name, the idle rows under them by name" "$(printf %s "$O" | grep '^top order:')" "top order: dbd top webd | app daily five hourly site weekly"
   check "the header carries the arrow"                       "$(printf %s "$O" | grep '^top head:')"  "top head: NAME ▲ ROLE PID UP CPU MEM"
-  O=$(S --press NAME --press NAME --render)
+  O=$(S --press NAME --render)                     # the file holds NAME asc from the run above: this press is the second
   check "a second press reverses it"                         "$(printf %s "$O" | grep '^top sort:')"  "top sort: NAME desc"
   check "reversed within each group, idle still under live"  "$(printf %s "$O" | grep '^top order:')" "top order: webd top dbd | weekly site hourly five daily app"
   check "the arrow turns"                                    "$(printf %s "$O" | grep '^top head:')"  "top head: NAME ▼ ROLE PID UP CPU MEM"
@@ -159,7 +159,7 @@ if [ -x ./bin/top ]; then
   sleep 1.1
   O=$(S --press UP --render | grep '^top order:')
   check "UP ascending: youngest first; idle by time to next run" "$O" "top order: top webd dbd | site five hourly daily weekly app"
-  O=$(S --press UP --press UP --render | grep '^top order:')
+  O=$(S --press UP --render | grep '^top order:')   # the second press on UP
   check "UP descending: oldest first"                        "$O" "top order: dbd webd top | app weekly daily hourly five site"
   # PID sorts as a number. dbd's and webd's pids are the suite's own.
   if [ "$DP" -lt "$W4" ]; then PE="dbd webd"; else PE="webd dbd"; fi
