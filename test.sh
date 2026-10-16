@@ -100,6 +100,42 @@ kill $W2 2>/dev/null; wait $W2 2>/dev/null; sleep 0.6
 T=$($TOPSELF 2>&1 | head -1)
 check "peer table shrank after a kill" "$T" "top selftest: peers=2 count=1"
 kill $W1 2>/dev/null; wait $W1 2>/dev/null
+
+echo "7b. the dashboard lists what is enabled at login but not running, with its next run"
+if [ -x ./bin/top ]; then
+  TA=$(mktemp -d /tmp/subtop.XXXXXX)
+  mkplist() { # name role schedule-xml
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">\n<plist version="1.0"><dict>\n<key>Label</key><string>dev.substrate.%s</string>\n<key>ProgramArguments</key><array><string>/usr/local/bin/sub</string><string>run</string><string>--name</string><string>%s</string><string>--role</string><string>%s</string><string>--</string><string>/usr/bin/true</string></array>\n%s</dict></plist>\n' "$1" "$1" "$2" "$3" > "$TA/dev.substrate.$1.plist"
+  }
+  mkplist daily  timer   '<key>RunAtLoad</key><true/><key>StartCalendarInterval</key><array><dict><key>Hour</key><integer>7</integer><key>Minute</key><integer>40</integer></dict><dict><key>Hour</key><integer>13</integer><key>Minute</key><integer>40</integer></dict></array>'
+  mkplist hourly timer   '<key>StartCalendarInterval</key><dict><key>Minute</key><integer>30</integer></dict>'
+  mkplist weekly timer   '<key>StartCalendarInterval</key><dict><key>Weekday</key><integer>0</integer><key>Hour</key><integer>4</integer><key>Minute</key><integer>15</integer></dict>'
+  mkplist five   timer   '<key>StartInterval</key><integer>300</integer>'
+  mkplist site   service '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>'
+  mkplist app    app     '<key>RunAtLoad</key><true/>'
+  mkplist webd   service '<key>RunAtLoad</key><true/><key>KeepAlive</key><true/>'
+  # 2026-10-15 10:00:00 local, a Thursday
+  NOW=$(date -j -f "%Y-%m-%d %H:%M:%S" "2026-10-15 10:00:00" +%s)
+  nr() { SUB_NOW=$NOW ./bin/top --next-run "$TA/dev.substrate.$1.plist"; }
+  check "two clock times: the next one today"          "$(nr daily)"  "daily timer next 13:40"
+  check "a minute only is hourly: the next half hour"  "$(nr hourly)" "hourly timer next 10:30"
+  check "a weekday: the next Sunday, named"            "$(nr weekly)" "weekly timer next Sun 04:15"
+  check "an interval says its period"                  "$(nr five)"   "five timer every 5m"
+  check "a KeepAlive service with no row is down"      "$(nr site)"   "site service down"
+  check "a login app with no row waits for login"      "$(nr app)"    "app app at login"
+  NOW2=$(date -j -f "%Y-%m-%d %H:%M:%S" "2026-10-15 14:00:00" +%s)
+  check "after the last time today: tomorrow, named"   "$(SUB_NOW=$NOW2 ./bin/top --next-run "$TA/dev.substrate.daily.plist")" "daily timer next Fri 07:40"
+  # the running webd (its row is live) is not listed idle; the six others are, greyed
+  ./bin/webd --join --port 8104 >/dev/null 2>&1 & W4=$!; waitport 8104; sleep 0.6   # the owner reaps W1's row on its tick
+  IDLE=$(SUB_AGENTS=$TA SUB_NOW=$NOW ./bin/top --selftest | grep -c "selftest: idle ")
+  check "idle rows: every enabled job without a live row, the live one left out" "$IDLE" "6"
+  check "selftest still leads with peers and count" "$(SUB_AGENTS=$TA ./bin/top --selftest | head -1)" "top selftest: peers=2 count=1"
+  check "selftest reports registered rows" "$(SUB_AGENTS=$TA ./bin/top --selftest | grep registered=)" "top selftest: registered=2"
+  kill $W4 2>/dev/null; wait $W4 2>/dev/null
+  rm -rf "$TA"
+else
+  echo "  (no Cocoa here: the dashboard's schedule reading is macOS only)"
+fi
 kill -TERM $DP 2>/dev/null; wait $DP 2>/dev/null
 
 echo "8. the database can be moved while everything is running -- admin only"

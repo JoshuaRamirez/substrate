@@ -210,6 +210,31 @@ static inline int sub_peer_alive(const sub_peer *p) {
     return pid > 0 && kill(pid, 0) == 0;
 }
 
+/* A process's own start time and cost, from the OS (macOS: libproc). The row's
+ * `since` is when the row was CLAIMED, which a re-join after a registry restart
+ * resets for every peer at once; the dashboard and `sub ps` ask the OS instead,
+ * so UP is per process. 0 when the OS cannot say (not macOS, or the pid is
+ * gone); callers fall back to `since`. */
+#if defined(__APPLE__)
+#include <libproc.h>
+static inline uint64_t sub_proc_start(pid_t pid) {
+    struct proc_bsdinfo bi;
+    if (pid <= 0 || proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &bi, sizeof bi) != (int)sizeof bi) return 0;
+    return (uint64_t)bi.pbi_start_tvsec;
+}
+/* Resident memory in bytes and CPU time in nanoseconds (user + system); 0s when the pid is gone. */
+static inline int sub_proc_cost(pid_t pid, uint64_t *rss, uint64_t *cpu_ns) {
+    struct proc_taskinfo ti;
+    *rss = 0; *cpu_ns = 0;
+    if (pid <= 0 || proc_pidinfo(pid, PROC_PIDTASKINFO, 0, &ti, sizeof ti) != (int)sizeof ti) return 0;
+    *rss = ti.pti_resident_size; *cpu_ns = ti.pti_total_user + ti.pti_total_system;
+    return 1;
+}
+#else
+static inline uint64_t sub_proc_start(pid_t pid) { (void)pid; return 0; }
+static inline int sub_proc_cost(pid_t pid, uint64_t *rss, uint64_t *cpu_ns) { (void)pid; *rss = 0; *cpu_ns = 0; return 0; }
+#endif
+
 static inline sub_peer *sub_claim_slot(sub_seg *s, const char *name, const char *role) {
     for (int i = 0; i < SUB_MAX_PEERS; i++) {
         sub_peer *p = &s->peers[i];

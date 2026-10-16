@@ -82,6 +82,8 @@ static int do_ps(void) {
         uint64_t pid   = atomic_load(&p->pid);
         uint64_t since = atomic_load(&p->since);
         int alive = sub_peer_alive(p);
+        uint64_t start = sub_proc_start((pid_t)pid);    /* the process's own start, not the row's claim (a re-join resets that) */
+        if (start) since = start;
         char age[16];
         fmt_age(now > since ? now - since : 0, age, sizeof age);
         printf("%-8llu  %-15.*s  %-15.*s  %-9s  %llu%s\n",
