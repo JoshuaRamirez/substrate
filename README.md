@@ -48,6 +48,9 @@ timer between ticks with its next run (`next 13:40`, `next Fri 07:40`,
 read from `~/Library/LaunchAgents/dev.substrate.*.plist` (`SUB_AGENTS` in a
 test); `sub-top --next-run <plist>` prints one job's line, and `SUB_NOW` pins
 the clock, which is how the suite checks the schedule reading.
+`sub-top --render out.png` draws the table offscreen and prints the document's
+height before and after the draw: a draw never changes geometry (the model is
+built on the tick), which the suite checks too.
 
 The registry needs no lock and no protocol for the same reason the count
 needs none, but by a different route: **ownership is partitioned.** Each
