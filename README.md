@@ -205,6 +205,8 @@ the registry away the tick waits five seconds, then runs unregistered,
 because a lost tick is worse than an unlisted one. An interval timer also
 runs at login; a calendar one waits for its time. `--env KEY=VALUE`
 (repeatable) adds a setting beside the PATH that is always written.
+`--no-restart` is for a login app: started at login and left alone when it
+exits, since quitting it was the point.
 
 **What it is still not.** A supervisor with policy. It does not order your
 services relative to each other, back off on crash loops beyond launchd's own

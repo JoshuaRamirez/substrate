@@ -374,7 +374,7 @@ static int bootstrap(const char *plist) {
 
 /* A schedule: how launchd starts the agent. KeepAlive is the service shape;
  * an interval or a list of clock times is a timer, run to completion. */
-typedef struct { int every; int n; int hour[32], minute[32]; int nenv; const char *env[16]; } sub_sched;
+typedef struct { int every; int n; int hour[32], minute[32]; int nenv; const char *env[16]; int norestart; } sub_sched;
 
 /* "02:30" or ":30" (hourly). -1 on anything else. */
 static int parse_hhmm(const char *t, int *h, int *m) {
@@ -418,7 +418,8 @@ static int write_plist(const char *name, char *const *args, int n, const char *w
     fputs("  <key>ProgramArguments</key>\n  <array>\n", f);
     for (int i = 0; i < n; i++) { fputs("    <string>", f); xml_out(f, args[i]); fputs("</string>\n", f); }
     fputs("  </array>\n", f);
-    if (!sc || (!sc->every && !sc->n)) fputs("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n", f);
+    if (sc && sc->norestart) fputs("  <key>RunAtLoad</key><true/>\n", f);   /* a login app: started once, not kept alive */
+    else if (!sc || (!sc->every && !sc->n)) fputs("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n", f);
     else if (sc->every) fprintf(f, "  <key>RunAtLoad</key><true/>\n  <key>StartInterval</key><integer>%d</integer>\n", sc->every);
     else {
         fputs("  <key>StartCalendarInterval</key>\n  <array>\n", f);
@@ -504,14 +505,16 @@ static int do_enable(int argc, char **argv) {
         else if (!strcmp(argv[i], "--nameplate") && i + 1 < argc) plate = argv[++i];
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-registry")) want_registry = 0;
+        else if (!strcmp(argv[i], "--no-restart")) sc.norestart = 1;
         else { fprintf(stderr, "sub enable: unknown option %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] [--env K=V]... [--every SECONDS | --at HH:MM[,HH:MM...]] -- cmd [args]\n");
+        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] [--env K=V]... [--every SECONDS | --at HH:MM[,HH:MM...] | --no-restart] -- cmd [args]\n");
         return 2;
     }
     if (!name) name = base_of(argv[i]);
     if (sc.every && at) { fprintf(stderr, "sub: --every and --at are two schedules; give one\n"); return 2; }
+    if (sc.norestart && (sc.every || at)) { fprintf(stderr, "sub: --no-restart is for a login app; a timer already runs to completion\n"); return 2; }
     if (sc.every < 0 || (sc.every == 0 && argc > 0 && at == NULL && strstr_argv(argv, argc, "--every"))) {
         fprintf(stderr, "sub: --every takes a whole number of seconds, at least 1\n"); return 2;
     }
@@ -576,7 +579,8 @@ static int do_enable(int argc, char **argv) {
         fprintf(stderr, "sub: launchctl could not load %s\n", plist);
         return 1;
     }
-    if (sc.every) printf("sub: %s enabled -- every %ds, and at login\n", name, sc.every);
+    if (sc.norestart) printf("sub: %s enabled -- starts at login, left alone when it exits\n", name);
+    else if (sc.every) printf("sub: %s enabled -- every %ds, and at login\n", name, sc.every);
     else if (sc.n) printf("sub: %s enabled -- at %s\n", name, at);
     else printf("sub: %s enabled -- starts at login, restarts if it exits\n", name);
     printf("     plist %s\n", plist);
@@ -667,6 +671,8 @@ static int usage(void) {
       "        schedule to completion (--at :MM means hourly), listed while\n"
       "        it runs, and run even if the registry is away.\n"
       "        --env KEY=VALUE (repeatable): a setting the service reads.\n"
+      "        --no-restart: a login app -- started at login, not started\n"
+      "        again when it exits (you quit it on purpose).\n"
       "        macOS only.\n"
       "  sub disable NAME\n"
       "        Stop it starting at login and remove its agent.\n"

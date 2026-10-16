@@ -613,6 +613,16 @@ else
   HOME="$TH" ./bin/sub enable --no-registry --name subenv2 --env NOEQUALS -- sleep 1 >/dev/null 2>&1
   check "--env without '=' is refused" "$?" "2"
 
+  # --no-restart: a login app (an .app bundle the user quits) starts at login
+  # and is left alone when it exits, instead of being started again.
+  HOME="$TH" ./bin/sub enable --no-registry --name subapp --no-restart -- sleep 1 >/dev/null 2>&1
+  PLR="$TH/Library/LaunchAgents/dev.substrate.subapp.plist"
+  check "--no-restart starts at login"            "$(plutil -extract RunAtLoad raw -o - "$PLR" 2>/dev/null)" "true"
+  check "and is not kept alive"                   "$(plutil -extract KeepAlive raw -o - "$PLR" 2>/dev/null || echo absent)" "absent"
+  check "and is not a timer"                      "$(plutil -extract StartInterval raw -o - "$PLR" 2>/dev/null || echo absent)" "absent"
+  HOME="$TH" ./bin/sub enable --no-registry --name subbad --no-restart --every 10 -- sleep 1 >/dev/null 2>&1
+  check "--no-restart with a schedule is refused" "$?" "2"
+
   # An absolute command is kept as given: a symlink such as Homebrew's
   # /opt/homebrew/opt/python@3.14/bin/python3.14 must not be resolved to a
   # versioned Cellar path that the next upgrade removes.
@@ -632,7 +642,7 @@ else
   launchctl bootout "gui/$(id -u)/dev.substrate.subxml" 2>/dev/null
   launchctl bootout "gui/$(id -u)/dev.substrate.subnp"   2>/dev/null
   launchctl bootout "gui/$(id -u)/dev.substrate.sublink" 2>/dev/null
-  for n in subev subat subhr subenv; do launchctl bootout "gui/$(id -u)/dev.substrate.$n" 2>/dev/null; done
+  for n in subev subat subhr subenv subapp; do launchctl bootout "gui/$(id -u)/dev.substrate.$n" 2>/dev/null; done
   rm -rf "$TH"
 fi
 echo
