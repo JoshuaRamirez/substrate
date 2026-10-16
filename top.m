@@ -304,6 +304,8 @@ typedef struct {
 } row_t;
 
 @interface TopView : NSView
+- (void)attachIfNeeded;
+- (int)rows:(row_t *)rows cap:(int)cap;
 @end
 
 @implementation TopView
@@ -500,6 +502,32 @@ static int selftest(void) {
     return 0;
 }
 
+/* --render PNG: the table drawn offscreen, no window, the same data path as
+ * the frame loop. It prints the document's height before the draw, after it,
+ * and what its rows need. AppKit's rule for a view is that a draw never
+ * changes geometry: a document whose frame is set from inside drawRect: is
+ * resized while its layer is being displayed, which AppKit may refuse with an
+ * exception it then crashes on (+[NSApplication _crashOnException:]). So the
+ * frame must already fit the rows before the draw, and be the same after. */
+static int render(const char *png) {
+    NSRect fr = NSMakeRect(0, 0, 760, 456);
+    TopView *v = [[TopView alloc] initWithFrame:fr];
+    [v attachIfNeeded];
+    static row_t tmp[SUB_MAX_PEERS + MAX_IDLE];
+    int n = SEG ? [v rows:tmp cap:SUB_MAX_PEERS + MAX_IDLE] : 0;
+    CGFloat want = 6 + 26 + n * ROW_H + 40;
+    CGFloat before = v.frame.size.height;
+    NSRect b = v.bounds;
+    NSBitmapImageRep *rep = [[NSBitmapImageRep alloc] initWithBitmapDataPlanes:NULL pixelsWide:(NSInteger)b.size.width pixelsHigh:(NSInteger)b.size.height
+        bitsPerSample:8 samplesPerPixel:4 hasAlpha:YES isPlanar:NO colorSpaceName:NSCalibratedRGBColorSpace bytesPerRow:0 bitsPerPixel:0];
+    NSGraphicsContext *ctx = [NSGraphicsContext graphicsContextWithBitmapImageRep:rep];
+    [v displayRectIgnoringOpacity:b inContext:ctx];
+    CGFloat after = v.frame.size.height;
+    if (png && *png) [[rep representationUsingType:NSBitmapImageFileTypePNG properties:@{}] writeToFile:[NSString stringWithUTF8String:png] atomically:YES];
+    printf("top render: rows=%d want=%.0f before=%.0f after=%.0f ok=%d\n", n, want, before, after, before == want && after == want);
+    return 0;
+}
+
 int main(int argc, const char **argv) {
     for (int i = 1; i < argc; i++) {
         if (!strcmp(argv[i], "--token")) {
@@ -513,6 +541,7 @@ int main(int argc, const char **argv) {
             return 0;
         }
         if (!strcmp(argv[i], "--selftest")) return selftest();
+        if (!strcmp(argv[i], "--render")) return render(i + 1 < argc ? argv[i + 1] : "");
         if (!strcmp(argv[i], "--next-run") && i + 1 < argc) {   /* one plist's next fire, for a test: SUB_NOW pins the clock */
             sub_job j;
             if (!job_from_plist([NSString stringWithUTF8String:argv[i + 1]], &j)) { fprintf(stderr, "cannot read %s\n", argv[i + 1]); return 2; }
