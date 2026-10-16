@@ -135,6 +135,41 @@ if [ -x ./bin/top ]; then
   check "the document's frame fits its rows before a draw, and a draw never changes it (card 2326)" "${R##*ok=}" "1"
   check "the offscreen draw lists every row (dbd, webd, its own, 6 idle)" "$(printf %s "$R" | sed -E 's/.*rows=([0-9]+).*/\1/')" "9"
   rm -f /tmp/subtop-render.$$.png
+
+  echo "7c. the column headers sort the table; live rows above the greyed ones; the sort holds (card 2338)"
+  # No pointer is driven here. --press hands the view an in-process mouseDown at
+  # a header's own hit box (an NSEvent object, never posted to the system), and
+  # --render reports the sort and the row order, live group | idle group.
+  SORTF=$TA/top-sort
+  S() { SUB_TOP_SORT=$SORTF SUB_AGENTS=$TA SUB_NOW=$NOW ./bin/top "$@" 2>/dev/null; }
+  check "no sort chosen: the registry's order, no arrow"     "$(S --render | grep '^top sort:')"  "top sort: none"
+  O=$(S --press NAME --render)
+  check "one press on NAME sorts by name, ascending"         "$(printf %s "$O" | grep '^top sort:')"  "top sort: NAME asc"
+  check "live rows by name, the idle rows under them by name" "$(printf %s "$O" | grep '^top order:')" "top order: dbd top webd | app daily five hourly site weekly"
+  check "the header carries the arrow"                       "$(printf %s "$O" | grep '^top head:')"  "top head: NAME ▲ ROLE PID UP CPU MEM"
+  O=$(S --press NAME --press NAME --render)
+  check "a second press reverses it"                         "$(printf %s "$O" | grep '^top sort:')"  "top sort: NAME desc"
+  check "reversed within each group, idle still under live"  "$(printf %s "$O" | grep '^top order:')" "top order: webd top dbd | weekly site hourly five daily app"
+  check "the arrow turns"                                    "$(printf %s "$O" | grep '^top head:')"  "top head: NAME ▼ ROLE PID UP CPU MEM"
+  check "the sort holds through a restart (read back from the file)" "$(S --render | grep '^top sort:')" "top sort: NAME desc"
+  check "a press on another column starts it ascending"      "$(S --press ROLE --render | grep '^top sort:')" "top sort: ROLE asc"
+  # UP sorts by age in seconds, not by its text: idle rows by time to their next
+  # run (down = 0, at login = never), so "at login" lands last, where text
+  # would put it first. dbd is the oldest live process; top (this render) the newest.
+  sleep 1.1
+  O=$(S --press UP --render | grep '^top order:')
+  check "UP ascending: youngest first; idle by time to next run" "$O" "top order: top webd dbd | site five hourly daily weekly app"
+  O=$(S --press UP --press UP --render | grep '^top order:')
+  check "UP descending: oldest first"                        "$O" "top order: dbd webd top | app weekly daily hourly five site"
+  # PID sorts as a number. dbd's and webd's pids are the suite's own.
+  if [ "$DP" -lt "$W4" ]; then PE="dbd webd"; else PE="webd dbd"; fi
+  O=$(S --press PID --render | grep '^top order:' | sed 's/ top //; s/|.*//; s/ *$//')
+  check "PID ascending puts the lower pid first"              "$O" "top order: $PE"
+  check "the sort is not written when a flag sets it"        "$(S --sort MEM- --render | grep '^top sort:'; cat $SORTF)" "top sort: MEM desc
+PID asc"
+  R=$(S --press CPU --render /tmp/subtop-sorted.$$.png | grep '^top render:')
+  check "a sorted draw still changes no geometry (card 2326)" "${R##*ok=}" "1"
+  rm -f /tmp/subtop-sorted.$$.png
   kill $W4 2>/dev/null; wait $W4 2>/dev/null
   rm -rf "$TA"
 else
