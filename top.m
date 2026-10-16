@@ -303,9 +303,19 @@ typedef struct {
     pid_t pid;
 } row_t;
 
+/* The model: built on the tick, drawn on the frame. Nothing in drawRect:
+ * reads the segment, the plists or the OS, and nothing in it changes
+ * geometry -- AppKit's rule for a view, and the crash of 2026-10-16 00:27
+ * (card 2326): the frame was set from inside drawRect:, while the layer was
+ * being displayed. */
+static row_t   g_rows[SUB_MAX_PEERS + MAX_IDLE];
+static int     g_nrows = 0;
+static CGFloat g_colx[NCOL];
+
 @interface TopView : NSView
 - (void)attachIfNeeded;
 - (int)rows:(row_t *)rows cap:(int)cap;
+- (void)reload;
 @end
 
 @implementation TopView
@@ -366,14 +376,31 @@ typedef struct {
     return n;
 }
 
+/* The tick: attach, read the rows, size the columns, fit the frame, then ask
+ * for a draw. The one place geometry changes. */
+- (void)reload {
+    [self attachIfNeeded];
+    g_nrows = SEG ? [self rows:g_rows cap:SUB_MAX_PEERS + MAX_IDLE] : 0;
+    NSDictionary *cell = [self mono:12 white:0.55], *hd = [self mono:10 white:0.38];
+    CGFloat cx = PAD + 22;
+    for (int c = 0; c < NCOL; c++) {                      /* columns size to their content: the widest cell or header in each */
+        CGFloat colw = [[NSString stringWithUTF8String:COLH[c]] sizeWithAttributes:hd].width;
+        for (int i = 0; i < g_nrows; i++) {
+            CGFloat w = [g_rows[i].cell[c] sizeWithAttributes:cell].width;
+            if (w > colw) colw = w;
+        }
+        g_colx[c] = cx; cx += colw + GAP;
+    }
+    [self fitRows:g_nrows];
+    [self setNeedsDisplay:YES];
+}
+
 - (void)drawRect:(NSRect)dirty {
     (void)dirty;
     NSRect b = self.bounds;
     CGFloat W = b.size.width;
     [[NSColor colorWithCalibratedWhite:0.09 alpha:1.0] setFill];
     NSRectFill(b);
-
-    [self attachIfNeeded];
     g_stop_n = 0;
 
     if (!SEG) {
@@ -381,26 +408,11 @@ typedef struct {
         NSDictionary *a = [self mono:13 white:0.45];
         NSSize ms = [m sizeWithAttributes:a];
         [m drawAtPoint:NSMakePoint((W - ms.width) / 2, 60) withAttributes:a];
-        [self fitRows:0];
         return;
     }
 
-    static row_t rows[SUB_MAX_PEERS + MAX_IDLE];
-    int n = [self rows:rows cap:SUB_MAX_PEERS + MAX_IDLE];
-    [self fitRows:n];
-
-    /* columns size to their content: the widest cell or header in each */
-    NSDictionary *cell = [self mono:12 white:0.55], *hd = [self mono:10 white:0.38];
-    CGFloat colw[NCOL], x[NCOL], cx = PAD + 22;
-    for (int c = 0; c < NCOL; c++) {
-        colw[c] = [[NSString stringWithUTF8String:COLH[c]] sizeWithAttributes:hd].width;
-        for (int i = 0; i < n; i++) {
-            CGFloat w = [rows[i].cell[c] sizeWithAttributes:cell].width;
-            if (w > colw[c]) colw[c] = w;
-        }
-        x[c] = cx; cx += colw[c] + GAP;
-    }
-
+    row_t *rows = g_rows; int n = g_nrows; CGFloat *x = g_colx;
+    NSDictionary *hd = [self mono:10 white:0.38];
     CGFloat y = 6;
     for (int c = 0; c < NCOL; c++)
         [[NSString stringWithUTF8String:COLH[c]] drawAtPoint:NSMakePoint(x[c], y) withAttributes:hd];
@@ -443,7 +455,8 @@ typedef struct {
 }
 
 /* The document is as tall as its rows (plus the footer), never shorter than
- * the clip view, so the scroll view scrolls exactly when there is more. */
+ * the clip view, so the scroll view scrolls exactly when there is more.
+ * Called from reload (the tick), never from a draw. */
 - (void)fitRows:(int)n {
     CGFloat want = 6 + 26 + n * ROW_H + 40;
     NSScrollView *sv = [self enclosingScrollView];
@@ -451,6 +464,11 @@ typedef struct {
     if (want < minh) want = minh;
     if (fabs(self.frame.size.height - want) > 0.5 || fabs(self.frame.size.width - w) > 0.5)
         [self setFrameSize:NSMakeSize(w, want)];
+}
+
+- (void)resizeWithOldSuperviewSize:(NSSize)old {   /* the clip view grew or shrank: refit, outside any draw */
+    [super resizeWithOldSuperviewSize:old];
+    [self fitRows:g_nrows];
 }
 
 - (void)mouseDown:(NSEvent *)e {
@@ -512,9 +530,8 @@ static int selftest(void) {
 static int render(const char *png) {
     NSRect fr = NSMakeRect(0, 0, 760, 456);
     TopView *v = [[TopView alloc] initWithFrame:fr];
-    [v attachIfNeeded];
-    static row_t tmp[SUB_MAX_PEERS + MAX_IDLE];
-    int n = SEG ? [v rows:tmp cap:SUB_MAX_PEERS + MAX_IDLE] : 0;
+    [v reload];                                  /* what the tick does: attach, rows, columns, the frame */
+    int n = g_nrows;
     CGFloat want = 6 + 26 + n * ROW_H + 40;
     CGFloat before = v.frame.size.height;
     NSRect b = v.bounds;
@@ -588,8 +605,9 @@ int main(int argc, const char **argv) {
         [w setContentView:root];
         [w makeKeyAndOrderFront:nil];
 
+        [v reload];
         [NSTimer scheduledTimerWithTimeInterval:0.2 repeats:YES block:^(NSTimer *t) {
-            (void)t; [hv setNeedsDisplay:YES]; [v setNeedsDisplay:YES];
+            (void)t; [v reload]; [hv setNeedsDisplay:YES];
         }];
 
         [NSApp activateIgnoringOtherApps:YES];

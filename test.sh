@@ -133,7 +133,7 @@ if [ -x ./bin/top ]; then
   check "selftest reports registered rows" "$(SUB_AGENTS=$TA ./bin/top --selftest | grep registered=)" "top selftest: registered=2"
   R=$(SUB_AGENTS=$TA SUB_NOW=$NOW ./bin/top --render /tmp/subtop-render.$$.png 2>/dev/null | grep "top render:")
   check "the document's frame fits its rows before a draw, and a draw never changes it (card 2326)" "${R##*ok=}" "1"
-  check "the offscreen draw lists every row (2 live, 6 idle)" "$(printf %s "$R" | sed -E 's/.*rows=([0-9]+).*/\1/')" "8"
+  check "the offscreen draw lists every row (dbd, webd, its own, 6 idle)" "$(printf %s "$R" | sed -E 's/.*rows=([0-9]+).*/\1/')" "9"
   rm -f /tmp/subtop-render.$$.png
   kill $W4 2>/dev/null; wait $W4 2>/dev/null
   rm -rf "$TA"
