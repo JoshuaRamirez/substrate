@@ -163,7 +163,14 @@ Three things it does at enable time, because launchd will not do them for you:
 - **Resolves your command to an absolute path.** launchd gives an agent a
   minimal `PATH` and no shell, so `node` means nothing by the time the plist
   runs. It also copies your current `PATH` into the agent, for services that
-  shell out.
+  shell out. A path you give is kept as you gave it, symlinks and all:
+  `/opt/homebrew/opt/python@3.14/bin/python3.14` stays that, not the
+  versioned Cellar path behind it that the next `brew upgrade` removes.
+- **Puts a nameplate first, if you give one.** macOS Login Items names an
+  agent after the file in `ProgramArguments[0]`, which for every agent `sub`
+  writes would be "sub". `--nameplate FILE` puts FILE there instead; it is an
+  executable that runs what follows it (`#!/bin/sh` and `exec "$@"` is the
+  whole file), so the agent carries its own name and runs the same command.
 - **Passes `--wait 60` to `sub run`.** launchd does not order agents, so a
   service can start before the registry does. Waiting is not the same as not
   caring — it still refuses to run unregistered, it just gives the registry a
@@ -171,6 +178,13 @@ Three things it does at enable time, because launchd will not do them for you:
   and bootstrapping the registry three seconds later: the service registers.
 - **Escapes your arguments.** A plist is XML, and an unescaped `&` is a file
   launchd rejects with a message about the file rather than the argument.
+
+**A service survives its registry restarting.** `sub-dbd` unlinks its segment
+and makes a new one each time it starts, so a wrapper that only blocked in
+`waitpid` would stay a row in a table nobody can see any more. `sub run`
+polls instead, and once a second re-joins a new owner if one appeared and
+puts the service's pid back on the row. Tested by stopping and restarting the
+registry under a running service: it is listed again, with the service's pid.
 
 **If you enable the registry at login, `./test.sh` stands it down for the
 duration and puts it back on exit.** launchd restarts a supervised `sub-dbd`

@@ -434,7 +434,7 @@ fi
 # asks whether it is a process registry for anything else on the machine --
 # which is the same question, if the answer is "yes, given a wrapper".
 echo "21. the registry supervises processes that share no code with it"
-pkill -f 'bin/sub run' 2>/dev/null
+pkill -f '^\./bin/sub run' 2>/dev/null   # only this suite's wrappers, never a live service's
 pkill -f 'bin/(dbd|webd)' 2>/dev/null; sleep 0.3
 
 ./bin/sub ps >/dev/null 2>&1
@@ -455,8 +455,11 @@ check "sub run passes a child's exit code through" "$?" "5"
 sleep 1
 check "a foreign process appears in the registry" \
       "$(./bin/sub ps | awk '$2=="svc"{print $2}')" "svc"
+# Count the rows this section made, not every row: a live service enabled at
+# login may re-attach to this registry while the suite runs, and it is not
+# this suite's business to kill it.
 check "sub ps claims no row of its own" \
-      "$(./bin/sub ps | awk '/registered$/{print $1}')" "2"
+      "$(./bin/sub ps | awk '$2=="dbd"||$2=="svc"{n++} $2=="sub"||$2=="ps"{n+=100} END{print n+0}')" "2"
 
 SPID=$(./bin/sub ps | awk '$2=="svc"{print $1}')
 WRAP=$(ps -o ppid= -p "$SPID" 2>/dev/null | tr -d ' ')
@@ -515,8 +518,21 @@ sleep 2
 ./bin/sub stop webd >/dev/null 2>&1
 check "a non-leader is signalled alone, never its group" "$?" "0"
 
+# A registry that restarts (a crash, an upgrade, this suite) unlinks its
+# segment and makes a new one. A service it supervises must come back on its
+# own, with the service's pid on the row, or the table lies by omission.
+( ./bin/sub run --name keep -- sh -c 'while :; do sleep 1; done' >/dev/null 2>&1 & )
+sleep 1
+./bin/dbd --stop >/dev/null 2>&1; sleep 0.3
+./bin/dbd >/dev/null 2>&1 & sleep 2.5
+check "a service re-joins a registry that restarted" \
+      "$(./bin/sub ps | awk '$2=="keep"{print $2}')" "keep"
+check "with the service's pid on the row, not the wrapper's" \
+      "$(ps -o command= -p "$(./bin/sub ps | awk '$2=="keep"{print $1}')" 2>/dev/null | cut -c1-5)" "sh -c"
+./bin/sub stop keep >/dev/null 2>&1
+
 ./bin/dbd --stop >/dev/null 2>&1
-pkill -f 'bin/sub run' 2>/dev/null
+pkill -f '^\./bin/sub run' 2>/dev/null   # only this suite's wrappers, never a live service's
 echo
 
 # launchd is how this comes back after a reboot. The plist is the artifact,
@@ -559,6 +575,28 @@ else
   check "and survives the round trip unchanged" \
         "$(PA "$PLX" | tail -1)" 'echo a&b<c>"d"'
 
+  # macOS Login Items names a launch agent after the file in ProgramArguments[0].
+  # Without a nameplate every agent is "sub"; with one it carries its own name.
+  NP="$TH/Desk Reports Page"; printf '#!/bin/sh\nexec "$@"\n' > "$NP"; chmod +x "$NP"
+  HOME="$TH" ./bin/sub enable --no-registry --name subnp --nameplate "$NP" -- sleep 600 >/dev/null 2>&1
+  PLN="$TH/Library/LaunchAgents/dev.substrate.subnp.plist"
+  check "a nameplate is ProgramArguments[0]"  "$(plutil -extract ProgramArguments.0 raw -o - "$PLN" 2>/dev/null)" "$NP"
+  check "then sub, by absolute path"          "$(plutil -extract ProgramArguments.1 raw -o - "$PLN" 2>/dev/null)" "$(cd "$(dirname ./bin/sub)" && pwd)/sub"
+  check "then 'sub run'"                      "$(plutil -extract ProgramArguments.2 raw -o - "$PLN" 2>/dev/null)" "run"
+  chmod -x "$NP"
+  HOME="$TH" ./bin/sub enable --no-registry --name subnp2 --nameplate "$NP" -- sleep 600 >/dev/null 2>&1
+  check "a nameplate that cannot run is refused" "$?" "2"
+  HOME="$TH" ./bin/sub enable --no-registry --name subnp3 --nameplate "$TH/no-such-file" -- sleep 600 >/dev/null 2>&1
+  check "a missing nameplate is refused"         "$?" "2"
+
+  # An absolute command is kept as given: a symlink such as Homebrew's
+  # /opt/homebrew/opt/python@3.14/bin/python3.14 must not be resolved to a
+  # versioned Cellar path that the next upgrade removes.
+  ln -s /usr/bin/true "$TH/true-link"
+  HOME="$TH" ./bin/sub enable --no-registry --name sublink -- "$TH/true-link" >/dev/null 2>&1
+  check "an absolute command stays the path you gave, symlink and all" \
+        "$(PA "$TH/Library/LaunchAgents/dev.substrate.sublink.plist" | grep -c "^$TH/true-link\$")" "1"
+
   check "enabled lists them" \
         "$(HOME="$TH" ./bin/sub enabled | awk '$1=="subci"||$1=="subxml"' | wc -l | tr -d ' ')" "2"
   HOME="$TH" ./bin/sub disable subci >/dev/null 2>&1
@@ -568,6 +606,8 @@ else
 
   launchctl bootout "gui/$(id -u)/dev.substrate.subci"  2>/dev/null
   launchctl bootout "gui/$(id -u)/dev.substrate.subxml" 2>/dev/null
+  launchctl bootout "gui/$(id -u)/dev.substrate.subnp"   2>/dev/null
+  launchctl bootout "gui/$(id -u)/dev.substrate.sublink" 2>/dev/null
   rm -rf "$TH"
 fi
 echo

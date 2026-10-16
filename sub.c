@@ -250,8 +250,22 @@ static int do_run(int argc, char **argv) {
      * -- reaping, `sub stop`, the dashboard -- reads this pid and acts on it. */
     if (joined) atomic_store(&C.slot->pid, (uint64_t)kid);
 
+    /* Wait by polling, not by blocking: a registry that restarts (a crash,
+     * an upgrade, the test suite) unlinks its segment and makes a new one,
+     * and a wrapper that only ever blocked in waitpid would stay a row in a
+     * table nobody can see any more. Once a second, revalidate -- re-join
+     * the new owner if one appeared -- and put the service's pid back on
+     * the row, since a fresh claim records the wrapper's. */
     int st = 0;
-    while (waitpid(kid, &st, 0) < 0 && errno == EINTR) { /* a forwarded signal */ }
+    for (;;) {
+        pid_t r = waitpid(kid, &st, WNOHANG);
+        if (r == kid) break;
+        if (r < 0 && errno != EINTR) break;
+        if (joined && sub_revalidate(&C) && C.slot &&
+            atomic_load(&C.slot->pid) != (uint64_t)kid)
+            atomic_store(&C.slot->pid, (uint64_t)kid);
+        usleep(500000);
+    }
     g_child = 0;
     if (joined) sub_close(&C);
 
@@ -291,7 +305,16 @@ static int self_path(char *out, size_t cap) {
  * by the time the plist runs. Resolve it now, while a usable PATH exists. */
 static int which_abs(const char *cmd, char *out, size_t cap) {
     if (strchr(cmd, '/')) {
-        if (!realpath(cmd, out)) return -1;
+        /* A path is kept as given, symlinks and all. Resolving
+         * /opt/homebrew/opt/python@3.14/bin/python3.14 to its Cellar path
+         * would pin a version the next upgrade removes. Only a relative
+         * path is anchored, to the directory it was given in. */
+        if (cmd[0] == '/') snprintf(out, cap, "%s", cmd);
+        else {
+            char cwd[PATH_MAX];
+            if (!getcwd(cwd, sizeof cwd)) return -1;
+            snprintf(out, cap, "%s/%s", cwd, cmd);
+        }
         return access(out, X_OK);
     }
     const char *path = getenv("PATH");
@@ -412,22 +435,33 @@ static int ensure_registry(void) {
 }
 
 static int do_enable(int argc, char **argv) {
-    const char *name = NULL, *role = "service", *dir = NULL;
+    const char *name = NULL, *role = "service", *dir = NULL, *plate = NULL;
     int i = 0, waitsec = 60, want_registry = 1;
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--")) { i++; break; }
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) role = argv[++i];
         else if (!strcmp(argv[i], "--dir")  && i + 1 < argc) dir  = argv[++i];
+        else if (!strcmp(argv[i], "--nameplate") && i + 1 < argc) plate = argv[++i];
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsec = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-registry")) want_registry = 0;
         else { fprintf(stderr, "sub enable: unknown option %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] -- cmd [args]\n");
+        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] -- cmd [args]\n");
         return 2;
     }
     if (!name) name = base_of(argv[i]);
+    /* macOS Login Items names an agent after the file in ProgramArguments[0].
+     * A nameplate is an executable that execs what follows it, so the agent
+     * carries its own name there instead of "sub". */
+    char plate_abs[PATH_MAX];
+    if (plate) {
+        if (which_abs(plate, plate_abs, sizeof plate_abs) != 0) {
+            fprintf(stderr, "sub: nameplate '%s' is not an executable file\n", plate);
+            return 2;
+        }
+    }
     if (strchr(name, '/')) { fprintf(stderr, "sub: a name cannot contain '/'\n"); return 2; }
 
     char me[PATH_MAX], cmd[PATH_MAX], cwd[PATH_MAX], ws[16];
@@ -449,6 +483,7 @@ static int do_enable(int argc, char **argv) {
     snprintf(rl, sizeof rl, "%s", role);
     char *args[64];
     int n = 0;
+    if (plate) args[n++] = plate_abs;
     args[n++] = me;
     args[n++] = v_run;
     args[n++] = v_name; args[n++] = nm;
@@ -548,10 +583,12 @@ static int usage(void) {
       "        Exits with the child's exit code.\n"
       "  sub ps\n"
       "        List every registered process. Registers nothing itself.\n"
-      "  sub enable [--name N] [--role R] [--dir D] -- cmd [args...]\n"
+      "  sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] -- cmd [args...]\n"
       "        Same as run, but at login and restarted if it exits, via a\n"
       "        launchd agent. Also enables the registry itself, unless you\n"
       "        pass --no-registry because you start it some other way.\n"
+      "        --nameplate: an executable that execs what follows it, put\n"
+      "        first so Login Items shows its name instead of \"sub\".\n"
       "        macOS only.\n"
       "  sub disable NAME\n"
       "        Stop it starting at login and remove its agent.\n"
