@@ -52,6 +52,18 @@ the clock, which is how the suite checks the schedule reading.
 height before and after the draw: a draw never changes geometry (the model is
 built on the tick), which the suite checks too.
 
+A click on a column header sorts the table by it, a second click reverses it,
+and the sorted header carries the arrow. Numbers sort as numbers (PID, CPU,
+MEM), UP by age (a greyed row by the time to its next run: `down` first,
+`at login` last), names as the Finder orders them. The live rows stay above
+the greyed ones and the sort applies within each group. The choice is kept in
+`~/Library/Application Support/substrate/top-sort` (`SUB_TOP_SORT` in a test),
+so it holds through every refresh and a restart. `sub-top --press NAME` (repeatable,
+before `--render`) hands the view a click at that header's own hit box as an
+in-process event, nothing posted to the screen; `--sort PID-` sets a sort for
+one run without writing it; `--render` then prints the sort, the row order
+(live `|` greyed) and the header texts, which is how the suite proves it.
+
 The registry needs no lock and no protocol for the same reason the count
 needs none, but by a different route: **ownership is partitioned.** Each
 process is the only writer of its own row. Claiming a free row is one
