@@ -149,6 +149,8 @@ agent instead, so the service starts at login and is restarted if it exits:
 
 ```sh
 sub enable --name api --role http:8099 -- node server.js
+sub enable --name nightly --at 02:30 -- ./backup.sh        # a timer
+sub enable --name sweep --every 300 --env MODE=on -- ./sweep  # every 5 minutes
 sub enabled
 sub disable api
 ```
@@ -186,11 +188,23 @@ polls instead, and once a second re-joins a new owner if one appeared and
 puts the service's pid back on the row. Tested by stopping and restarting the
 registry under a running service: it is listed again, with the service's pid.
 
-**If you enable the registry at login, `./test.sh` stands it down for the
-duration and puts it back on exit.** launchd restarts a supervised `sub-dbd`
-the instant the suite kills it, and the suite would then be measuring a
-segment it does not control. That was ~30 cascading failures before the
-suite learned to check.
+**The segment's name is `SUB_SHM` when set, else `/sub.v8`.** Every binary
+and both foreign peers read it, so one machine can carry a second pipeline
+beside the one its services run on. `./test.sh` sets its own
+(`/sub.test.<pid>`), so the suite never touches a registry enabled at login
+and the services on it never re-join the suite's owner. (Before this the
+suite stood the launchd registry down for the duration: ~30 cascading
+failures otherwise, and, once services re-joined on their own, the suite
+counting the desk's rows as its own.)
+
+**Timers.** `sub enable --every SECONDS` or `--at HH:MM[,HH:MM…]` (`:MM`
+alone is hourly) writes a StartInterval or StartCalendarInterval agent
+instead of a KeepAlive one. The program is still `sub run`, so a tick shows
+in the table while it runs and `sub-dbd` reaps its row when it exits; with
+the registry away the tick waits five seconds, then runs unregistered,
+because a lost tick is worse than an unlisted one. An interval timer also
+runs at login; a calendar one waits for its time. `--env KEY=VALUE`
+(repeatable) adds a setting beside the PATH that is always written.
 
 **What it is still not.** A supervisor with policy. It does not order your
 services relative to each other, back off on crash loops beyond launchd's own

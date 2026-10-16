@@ -87,7 +87,7 @@ static NSString *uptime_str(uint64_t since) {
                               [NSColor colorWithCalibratedWhite:0.62 alpha:1.0] }];
 
     NSString *sub = SEG ? [NSString stringWithFormat:@"%s  format v%u  %d slots",
-                                    SUB_SHM_NAME, SUB_VERSION, SUB_MAX_PEERS]
+                                    sub_shm_name(), SUB_VERSION, SUB_MAX_PEERS]
                         : @"no owner attached";
     [sub drawAtPoint:NSMakePoint(PAD, H - 54) withAttributes:[self mono:10 white:0.40]];
 

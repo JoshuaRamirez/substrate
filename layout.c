@@ -13,7 +13,7 @@ static void f(const char *name, size_t off, size_t size) {
 
 int main(void) {
     printf("shm        %s\nmagic      0x%08X\nversion    %u\nsize       %zu\n\n",
-           SUB_SHM_NAME, SUB_MAGIC, SUB_VERSION, sizeof(sub_seg));
+           sub_shm_name(), SUB_MAGIC, SUB_VERSION, sizeof(sub_seg));
     printf("%-14s %6s %6s\n", "FIELD", "OFF", "SIZE");
     f("magic",       offsetof(sub_seg, magic),       sizeof(uint32_t));
     f("version",     offsetof(sub_seg, version),     sizeof(uint32_t));

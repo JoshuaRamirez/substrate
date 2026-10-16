@@ -13,7 +13,8 @@ would be a process that *looks* joined and silently corrupts the ring.
 import ctypes, os, sys, time
 
 # ---- the contract (see: ./bin/layout) ----
-SHM_NAME, MAGIC, VERSION, SEG_SIZE = b"/sub.v8", 0x53554238, 8, 67141632
+_env = __import__("os").environ.get("SUB_SHM", "")
+SHM_NAME, MAGIC, VERSION, SEG_SIZE = (_env.encode() if _env.startswith("/") and 1 < len(_env) < 31 else b"/sub.v8"), 0x53554238, 8, 67141632
 OFF_COUNT, OFF_OWNER_PID, OFF_NEXT_ID = 8, 16, 336
 OFF_RING, OFF_PEERS = 7008, 8800
 OFF_ARENA, BLOCK_SIZE = 32768, 1048576

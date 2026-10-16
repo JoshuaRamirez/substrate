@@ -2,6 +2,10 @@
 # Runs the falsification criteria from the concept. Exits non-zero on failure.
 cd "$(dirname "$0")"
 PORT=8099
+# This suite owns a segment of its own. The machine's pipeline (/sub.v8, and
+# every service enabled on it, which re-joins any owner that appears there)
+# is never touched, so the counts here are the suite's alone.
+export SUB_SHM=/sub.test.$$
 fail=0
 ok()   { printf "  PASS  %s\n" "$1"; }
 bad()  { printf "  FAIL  %s\n" "$1"; fail=1; }
@@ -31,26 +35,9 @@ else
 fi
 [ -x ./bin/gui ] || echo "  (no Cocoa here: gui/top checks run against bin/peer)"
 
-# A registry enabled at login is supervised by launchd, which restarts it the
-# instant this suite kills it -- so the suite would measure a segment it does
-# not control and fail ~30 checks for reasons that are not bugs. Stand it down
-# for the duration, and put it back however this script exits.
-LD_REG="dev.substrate.registry"
-LD_WAS=0
-if command -v launchctl >/dev/null 2>&1 && \
-   launchctl print "gui/$(id -u)/$LD_REG" >/dev/null 2>&1; then
-  echo "  (standing down the launchd registry agent for the duration)"
-  launchctl bootout "gui/$(id -u)/$LD_REG" >/dev/null 2>&1
-  LD_WAS=1
-  sleep 0.5
-fi
-restore_agent() {
-  [ "$LD_WAS" = "1" ] || return 0
-  launchctl bootstrap "gui/$(id -u)" \
-    "$HOME/Library/LaunchAgents/$LD_REG.plist" >/dev/null 2>&1
-}
-trap 'restore_agent' EXIT INT TERM
-
+# The machine's registry (launchd dev.substrate.registry, on /sub.v8) is left
+# alone: this suite's processes all read SUB_SHM, so nothing here can see or
+# touch the desk's rows, and nothing on the desk can see the suite's.
 pkill -f 'bin/(dbd|webd)' 2>/dev/null
 rm -f substrate.db; sleep 0.3
 
@@ -416,7 +403,7 @@ else
     ./bin/storm 64 500 2>/dev/null | awk "/duplicates/{print \"DUP \" \$2} /gaps/{print \"GAP \" \$5} /dropped/{print \"DROP \" \$3} /joined/{print \"JOIN \" \$4}"
     useradd -m intruder 2>/dev/null
     su intruder -c "/src/bin/storm 1 1" >/dev/null 2>&1; echo "OTHERUSER $?"
-    stat -c "%a" /dev/shm/sub.v8 | sed "s/^/MODE /"
+    stat -c "%a" "/dev/shm/${SUB_SHM#/}" | sed "s/^/MODE /"
   ' 2>/dev/null)
   g(){ echo "$OUT" | awk -v k="$1" '$1==k{print $2}'; }
   check "linux computes the same segment size" "$(g SIZE)"  "$(./bin/layout | awk '/^size/{print $2}')"
@@ -589,6 +576,43 @@ else
   HOME="$TH" ./bin/sub enable --no-registry --name subnp3 --nameplate "$TH/no-such-file" -- sleep 600 >/dev/null 2>&1
   check "a missing nameplate is refused"         "$?" "2"
 
+  # A timer: --every SECONDS or --at HH:MM[,HH:MM...] (or :MM, hourly) writes a
+  # schedule instead of KeepAlive. The program is still sub run, so a tick
+  # shows in the table while it runs; it runs even if the registry is away
+  # (a lost tick is worse than an unlisted one), after a short wait for it.
+  HOME="$TH" ./bin/sub enable --no-registry --name subev --every 300 -- sleep 1 >/dev/null 2>&1
+  PLE="$TH/Library/LaunchAgents/dev.substrate.subev.plist"
+  check "--every writes StartInterval"           "$(plutil -extract StartInterval raw -o - "$PLE" 2>/dev/null)" "300"
+  check "a timer is not kept alive"              "$(plutil -extract KeepAlive raw -o - "$PLE" 2>/dev/null || echo absent)" "absent"
+  check "an interval timer also runs at login"   "$(plutil -extract RunAtLoad raw -o - "$PLE" 2>/dev/null)" "true"
+  check "a tick runs even with the registry away" "$(PA "$PLE" | grep -c -- '--anyway')" "1"
+  HOME="$TH" ./bin/sub enable --no-registry --name subat --at 02:30,13:40 -- sleep 1 >/dev/null 2>&1
+  PLA="$TH/Library/LaunchAgents/dev.substrate.subat.plist"
+  check "--at writes StartCalendarInterval, one entry per time" \
+        "$(plutil -convert json -o - "$PLA" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["StartCalendarInterval"]))')" \
+        '[{"Hour": 2, "Minute": 30}, {"Hour": 13, "Minute": 40}]'
+  check "a calendar timer does not run at login"  "$(plutil -extract RunAtLoad raw -o - "$PLA" 2>/dev/null || echo absent)" "absent"
+  HOME="$TH" ./bin/sub enable --no-registry --name subhr --at :30 -- sleep 1 >/dev/null 2>&1
+  check "--at :MM is hourly" \
+        "$(plutil -convert json -o - "$TH/Library/LaunchAgents/dev.substrate.subhr.plist" | python3 -c 'import json,sys; print(json.dumps(json.load(sys.stdin)["StartCalendarInterval"]))')" \
+        '[{"Minute": 30}]'
+  HOME="$TH" ./bin/sub enable --no-registry --name subbad --every 10 --at 02:00 -- sleep 1 >/dev/null 2>&1
+  check "--every and --at together are refused"  "$?" "2"
+  HOME="$TH" ./bin/sub enable --no-registry --name subbad --at 25:99 -- sleep 1 >/dev/null 2>&1
+  check "a time that is not HH:MM is refused"    "$?" "2"
+  HOME="$TH" ./bin/sub enable --no-registry --name subbad --every 0 -- sleep 1 >/dev/null 2>&1
+  check "an interval under a second is refused"  "$?" "2"
+  check "enabled lists timers too" "$(HOME="$TH" ./bin/sub enabled | awk '$1=="subev"||$1=="subat"||$1=="subhr"' | wc -l | tr -d ' ')" "3"
+
+  # --env K=V, repeatable: a setting the service reads, beside the PATH that
+  # is always written. A value without '=' is a mistake, not a setting.
+  HOME="$TH" ./bin/sub enable --no-registry --name subenv --env DESK_SWEEP_ENGINE=on --env HOURLY_MAX_PUSHES=3 -- sleep 1 >/dev/null 2>&1
+  PLV="$TH/Library/LaunchAgents/dev.substrate.subenv.plist"
+  check "--env writes each setting" \
+        "$(plutil -convert json -o - "$PLV" | python3 -c 'import json,sys; e=json.load(sys.stdin)["EnvironmentVariables"]; print(e["DESK_SWEEP_ENGINE"], e["HOURLY_MAX_PUSHES"], "PATH" in e)')" "on 3 True"
+  HOME="$TH" ./bin/sub enable --no-registry --name subenv2 --env NOEQUALS -- sleep 1 >/dev/null 2>&1
+  check "--env without '=' is refused" "$?" "2"
+
   # An absolute command is kept as given: a symlink such as Homebrew's
   # /opt/homebrew/opt/python@3.14/bin/python3.14 must not be resolved to a
   # versioned Cellar path that the next upgrade removes.
@@ -608,6 +632,7 @@ else
   launchctl bootout "gui/$(id -u)/dev.substrate.subxml" 2>/dev/null
   launchctl bootout "gui/$(id -u)/dev.substrate.subnp"   2>/dev/null
   launchctl bootout "gui/$(id -u)/dev.substrate.sublink" 2>/dev/null
+  for n in subev subat subhr subenv; do launchctl bootout "gui/$(id -u)/dev.substrate.$n" 2>/dev/null; done
   rm -rf "$TH"
 fi
 echo

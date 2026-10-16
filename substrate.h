@@ -50,6 +50,7 @@
 #include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -61,6 +62,14 @@
 #include <errno.h>
 
 #define SUB_SHM_NAME  "/sub.v8"      /* macOS caps shm names at 31 chars */
+/* The segment's name, at run time: SUB_SHM in the environment when it names
+ * a segment (a leading slash), else SUB_SHM_NAME. One machine can then carry
+ * a second pipeline -- a test suite's, beside the one the desk runs on --
+ * without the two ever seeing each other's rows. */
+static inline const char *sub_shm_name(void) {
+    const char *e = getenv("SUB_SHM");
+    return (e && e[0] == '/' && e[1] && strlen(e) < 31) ? e : SUB_SHM_NAME;
+}
 #define SUB_MAGIC     0x53554238u    /* "SUB8" */
 #define SUB_VERSION   8u             /* pin the FORMAT, not the binary */
 #define SUB_MAX_PEERS 256            /* was 16, which silently capped contention
@@ -747,7 +756,7 @@ static inline void sub_abspath(const char *in, char *out, size_t cap) {
  * sets *err: 1 = no owner, 2 = bad magic, 3 = format mismatch. The dashboard
  * polls this, so it must stay silent. */
 static inline sub_seg *sub_attach(int *err) {
-    int fd = shm_open(SUB_SHM_NAME, O_RDWR, 0600);
+    int fd = shm_open(sub_shm_name(), O_RDWR, 0600);
     if (fd < 0) { *err = 1; return NULL; }
     void *p = mmap(NULL, sizeof(sub_seg), PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
     close(fd);
@@ -777,7 +786,7 @@ static inline int sub_open_joined(substrate *c, const char *name, const char *ro
     sub_seg *s = sub_attach(&err);
     if (!s) {
         if (err == 1) fprintf(stderr, "join failed: no owner on %s -- start dbd first\n",
-                              SUB_SHM_NAME);
+                              sub_shm_name());
         else if (err == 2) fprintf(stderr, "join refused: bad magic\n");
         else fprintf(stderr, "join refused: this binary speaks format v%u\n", SUB_VERSION);
         return -1;

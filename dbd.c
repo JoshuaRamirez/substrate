@@ -75,7 +75,7 @@ static void retarget(const char *want) {
 static int do_stop(void) {
     int err = 0;
     sub_seg *s = sub_attach(&err);
-    if (!s) { printf("dbd: no segment on %s\n", SUB_SHM_NAME); return 0; }
+    if (!s) { printf("dbd: no segment on %s\n", sub_shm_name()); return 0; }
     pid_t who = (pid_t)atomic_load(&s->owner_pid);
     if (!sub_owner_alive(s)) {
         munmap(s, sizeof *s);
@@ -136,12 +136,12 @@ static int do_unlink(void) {
          * next dbd creates a second world beside it. Refuse. */
         if (live) {
             fprintf(stderr, "dbd: refusing to unlink %s -- owner pid %d is alive "
-                            "(--stop it first)\n", SUB_SHM_NAME, (int)who);
+                            "(--stop it first)\n", sub_shm_name(), (int)who);
             return 3;
         }
     }
-    if (shm_unlink(SUB_SHM_NAME) == 0)  printf("dbd: unlinked %s\n", SUB_SHM_NAME);
-    else if (errno == ENOENT)           printf("dbd: %s already gone\n", SUB_SHM_NAME);
+    if (shm_unlink(sub_shm_name()) == 0)  printf("dbd: unlinked %s\n", sub_shm_name());
+    else if (errno == ENOENT)           printf("dbd: %s already gone\n", sub_shm_name());
     else { perror("dbd: shm_unlink"); return 1; }
     return 0;
 }
@@ -180,14 +180,14 @@ int main(int argc, char **argv) {
             munmap(existing, sizeof *existing);
             if (live) {
                 fprintf(stderr, "dbd: refusing to start -- owner already running "
-                                "on %s (pid %d)\n", SUB_SHM_NAME, who);
+                                "on %s (pid %d)\n", sub_shm_name(), who);
                 return 3;
             }
         }
     }
-    shm_unlink(SUB_SHM_NAME);
+    shm_unlink(sub_shm_name());
 
-    int fd = shm_open(SUB_SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
+    int fd = shm_open(sub_shm_name(), O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0) { perror("shm_open"); return 1; }
     /* No fchmod here: macOS rejects it on an shm descriptor (EINVAL), and it
      * is not needed -- umask can only CLEAR permission bits, never add them,
@@ -214,7 +214,7 @@ int main(int argc, char **argv) {
     g_self = sub_claim_slot(g_seg, "dbd", "owner");
 
     printf("dbd: owning %s  (format v%u, %zu bytes, %d slots)  restored count=%llu\n",
-           SUB_SHM_NAME, SUB_VERSION, sizeof(sub_seg), SUB_MAX_PEERS,
+           sub_shm_name(), SUB_VERSION, sizeof(sub_seg), SUB_MAX_PEERS,
            (unsigned long long)start);
     printf("dbd: database %s\n", DBFILE);
     printf("dbd: admin token minted (%s)\n",
@@ -275,7 +275,7 @@ int main(int argc, char **argv) {
     sub_release_slot(g_self);
     g_seg->magic = 0;              /* revoke: late joiners must not attach */
     munmap(g_seg, sizeof(sub_seg));
-    shm_unlink(SUB_SHM_NAME);
+    shm_unlink(sub_shm_name());
     printf("\ndbd: stopped, persisted count=%llu to %s\n",
            (unsigned long long)final, DBFILE);
     return 0;

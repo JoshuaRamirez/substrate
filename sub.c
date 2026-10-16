@@ -21,6 +21,7 @@
  * is why pypeer.py and swiftpeer.swift keep working without being told.
  */
 #include "substrate.h"
+#include <ctype.h>
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <limits.h>
@@ -371,8 +372,36 @@ static int bootstrap(const char *plist) {
     return run_cmd(av, 0);
 }
 
+/* A schedule: how launchd starts the agent. KeepAlive is the service shape;
+ * an interval or a list of clock times is a timer, run to completion. */
+typedef struct { int every; int n; int hour[32], minute[32]; int nenv; const char *env[16]; } sub_sched;
+
+/* "02:30" or ":30" (hourly). -1 on anything else. */
+static int parse_hhmm(const char *t, int *h, int *m) {
+    const char *c = strchr(t, ':');
+    if (!c || strlen(c + 1) != 2 || !isdigit((unsigned char)c[1]) || !isdigit((unsigned char)c[2])) return -1;
+    *m = atoi(c + 1);
+    if (*m > 59) return -1;
+    if (c == t) { *h = -1; return 0; }
+    if (c - t > 2) return -1;
+    for (const char *q = t; q < c; q++) if (!isdigit((unsigned char)*q)) return -1;
+    *h = atoi(t);
+    return *h > 23 ? -1 : 0;
+}
+
+static int parse_at(const char *list, sub_sched *sc) {
+    char buf[512];
+    snprintf(buf, sizeof buf, "%s", list);
+    for (char *t = strtok(buf, ","); t; t = strtok(NULL, ",")) {
+        if (sc->n >= 32) return -1;
+        if (parse_hhmm(t, &sc->hour[sc->n], &sc->minute[sc->n]) < 0) return -1;
+        sc->n++;
+    }
+    return sc->n ? 0 : -1;
+}
+
 /* Write a plist, atomically: launchd may be reading the directory. */
-static int write_plist(const char *name, char *const *args, int n, const char *wd) {
+static int write_plist(const char *name, char *const *args, int n, const char *wd, const sub_sched *sc) {
     char path[PATH_MAX], tmp[PATH_MAX], logs[PATH_MAX];
     agent_path(name, path, sizeof path);
     snprintf(tmp, sizeof tmp, "%s.tmp", path);
@@ -389,7 +418,17 @@ static int write_plist(const char *name, char *const *args, int n, const char *w
     fputs("  <key>ProgramArguments</key>\n  <array>\n", f);
     for (int i = 0; i < n; i++) { fputs("    <string>", f); xml_out(f, args[i]); fputs("</string>\n", f); }
     fputs("  </array>\n", f);
-    fputs("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n", f);
+    if (!sc || (!sc->every && !sc->n)) fputs("  <key>RunAtLoad</key><true/>\n  <key>KeepAlive</key><true/>\n", f);
+    else if (sc->every) fprintf(f, "  <key>RunAtLoad</key><true/>\n  <key>StartInterval</key><integer>%d</integer>\n", sc->every);
+    else {
+        fputs("  <key>StartCalendarInterval</key>\n  <array>\n", f);
+        for (int i = 0; i < sc->n; i++) {
+            fputs("    <dict>", f);
+            if (sc->hour[i] >= 0) fprintf(f, "<key>Hour</key><integer>%d</integer>", sc->hour[i]);
+            fprintf(f, "<key>Minute</key><integer>%d</integer></dict>\n", sc->minute[i]);
+        }
+        fputs("  </array>\n", f);
+    }
     if (wd) { fputs("  <key>WorkingDirectory</key><string>", f); xml_out(f, wd); fputs("</string>\n", f); }
     for (int i = 0; i < 2; i++) {
         fprintf(f, "  <key>Standard%sPath</key><string>", i ? "Error" : "Out");
@@ -398,9 +437,15 @@ static int write_plist(const char *name, char *const *args, int n, const char *w
     /* Give the agent the PATH this shell has. Without it, a service that
      * shells out finds a four-entry PATH and fails in a confusing place. */
     const char *pth = getenv("PATH");
-    if (pth) {
-        fputs("  <key>EnvironmentVariables</key><dict><key>PATH</key><string>", f);
-        xml_out(f, pth); fputs("</string></dict>\n", f);
+    if (pth || (sc && sc->nenv)) {
+        fputs("  <key>EnvironmentVariables</key><dict>\n", f);
+        if (pth) { fputs("    <key>PATH</key><string>", f); xml_out(f, pth); fputs("</string>\n", f); }
+        for (int i = 0; sc && i < sc->nenv; i++) {       /* K=V, validated at parse time */
+            const char *eq = strchr(sc->env[i], '=');
+            fputs("    <key>", f); fwrite(sc->env[i], 1, (size_t)(eq - sc->env[i]), f);
+            fputs("</key><string>", f); xml_out(f, eq + 1); fputs("</string>\n", f);
+        }
+        fputs("  </dict>\n", f);
     }
     fputs("</dict>\n</plist>\n", f);
     if (fclose(f) != 0) { unlink(tmp); return -1; }
@@ -424,7 +469,7 @@ static int ensure_registry(void) {
         return -1;
     }
     char *const args[] = { dbd, NULL };
-    if (write_plist("registry", args, 1, NULL) < 0) return -1;
+    if (write_plist("registry", args, 1, NULL, NULL) < 0) return -1;
     bootout(SUB_LABEL_PFX "registry");
     if (bootstrap(plist) != 0) {
         fprintf(stderr, "sub: launchctl could not load the registry agent\n");
@@ -434,11 +479,25 @@ static int ensure_registry(void) {
     return 0;
 }
 
+static int strstr_argv(char **argv, int argc, const char *flag) {
+    for (int k = 0; k < argc; k++) { if (!strcmp(argv[k], "--")) break; if (!strcmp(argv[k], flag)) return 1; }
+    return 0;
+}
+
 static int do_enable(int argc, char **argv) {
-    const char *name = NULL, *role = "service", *dir = NULL, *plate = NULL;
+    const char *name = NULL, *role = "service", *dir = NULL, *plate = NULL, *at = NULL;
     int i = 0, waitsec = 60, want_registry = 1;
+    sub_sched sc = {0};
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--")) { i++; break; }
+        else if (!strcmp(argv[i], "--every") && i + 1 < argc) sc.every = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--at") && i + 1 < argc) at = argv[++i];
+        else if (!strcmp(argv[i], "--env") && i + 1 < argc) {
+            const char *kv = argv[++i], *eq = strchr(kv, '=');
+            if (!eq || eq == kv) { fprintf(stderr, "sub: --env takes KEY=VALUE, got '%s'\n", kv); return 2; }
+            if (sc.nenv >= 16) { fprintf(stderr, "sub: at most 16 --env settings\n"); return 2; }
+            sc.env[sc.nenv++] = kv;
+        }
         else if (!strcmp(argv[i], "--name") && i + 1 < argc) name = argv[++i];
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) role = argv[++i];
         else if (!strcmp(argv[i], "--dir")  && i + 1 < argc) dir  = argv[++i];
@@ -448,10 +507,18 @@ static int do_enable(int argc, char **argv) {
         else { fprintf(stderr, "sub enable: unknown option %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] -- cmd [args]\n");
+        fprintf(stderr, "usage: sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] [--env K=V]... [--every SECONDS | --at HH:MM[,HH:MM...]] -- cmd [args]\n");
         return 2;
     }
     if (!name) name = base_of(argv[i]);
+    if (sc.every && at) { fprintf(stderr, "sub: --every and --at are two schedules; give one\n"); return 2; }
+    if (sc.every < 0 || (sc.every == 0 && argc > 0 && at == NULL && strstr_argv(argv, argc, "--every"))) {
+        fprintf(stderr, "sub: --every takes a whole number of seconds, at least 1\n"); return 2;
+    }
+    if (at && parse_at(at, &sc) < 0) {
+        fprintf(stderr, "sub: --at takes HH:MM (or :MM for hourly), comma-separated, got '%s'\n", at); return 2;
+    }
+    int timer = sc.every || sc.n;
     /* macOS Login Items names an agent after the file in ProgramArguments[0].
      * A nameplate is an executable that execs what follows it, so the agent
      * carries its own name there instead of "sub". */
@@ -477,7 +544,10 @@ static int do_enable(int argc, char **argv) {
      * signals to its group, and exits with the child's exit code, which is
      * exactly the contract KeepAlive wants. */
     char v_run[] = "run", v_name[] = "--name", v_role[] = "--role",
-         v_wait[] = "--wait", v_end[] = "--";
+         v_wait[] = "--wait", v_any[] = "--anyway", v_end[] = "--";
+    /* A timer's tick must happen: with the registry away it waits briefly,
+     * then runs unregistered. A lost tick is worse than an unlisted one. */
+    if (timer) snprintf(ws, sizeof ws, "%d", waitsec > 5 ? 5 : waitsec);
     char nm[SUB_NAMELEN * 4], rl[SUB_NAMELEN * 4];
     snprintf(nm, sizeof nm, "%s", name);
     snprintf(rl, sizeof rl, "%s", role);
@@ -489,6 +559,7 @@ static int do_enable(int argc, char **argv) {
     args[n++] = v_name; args[n++] = nm;
     args[n++] = v_role; args[n++] = rl;
     args[n++] = v_wait; args[n++] = ws;
+    if (timer) args[n++] = v_any;
     args[n++] = v_end;
     args[n++] = cmd;
     for (int k = i + 1; k < argc && n < 63; k++) args[n++] = argv[k];
@@ -499,13 +570,15 @@ static int do_enable(int argc, char **argv) {
     char plist[PATH_MAX], label[256];
     agent_path(name, plist, sizeof plist);
     snprintf(label, sizeof label, SUB_LABEL_PFX "%s", name);
-    if (write_plist(name, args, n, dir) < 0) return 1;
+    if (write_plist(name, args, n, dir, &sc) < 0) return 1;
     bootout(label);                       /* re-enabling is allowed */
     if (bootstrap(plist) != 0) {
         fprintf(stderr, "sub: launchctl could not load %s\n", plist);
         return 1;
     }
-    printf("sub: %s enabled -- starts at login, restarts if it exits\n", name);
+    if (sc.every) printf("sub: %s enabled -- every %ds, and at login\n", name, sc.every);
+    else if (sc.n) printf("sub: %s enabled -- at %s\n", name, at);
+    else printf("sub: %s enabled -- starts at login, restarts if it exits\n", name);
     printf("     plist %s\n", plist);
     printf("     log   %s/Library/Logs/substrate/%s.log\n", getenv("HOME"), name);
     return 0;
@@ -583,12 +656,17 @@ static int usage(void) {
       "        Exits with the child's exit code.\n"
       "  sub ps\n"
       "        List every registered process. Registers nothing itself.\n"
-      "  sub enable [--name N] [--role R] [--dir D] [--nameplate FILE] -- cmd [args...]\n"
+      "  sub enable [--name N] [--role R] [--dir D] [--nameplate FILE]\n"
+      "             [--every SECONDS | --at HH:MM[,HH:MM...]] -- cmd [args...]\n"
       "        Same as run, but at login and restarted if it exits, via a\n"
       "        launchd agent. Also enables the registry itself, unless you\n"
       "        pass --no-registry because you start it some other way.\n"
       "        --nameplate: an executable that execs what follows it, put\n"
       "        first so Login Items shows its name instead of \"sub\".\n"
+      "        --every / --at: a timer instead of a service -- run on that\n"
+      "        schedule to completion (--at :MM means hourly), listed while\n"
+      "        it runs, and run even if the registry is away.\n"
+      "        --env KEY=VALUE (repeatable): a setting the service reads.\n"
       "        macOS only.\n"
       "  sub disable NAME\n"
       "        Stop it starting at login and remove its agent.\n"
@@ -600,7 +678,7 @@ static int usage(void) {
       "\n"
       "The registry is the segment %s (format v%u), owned by sub-dbd.\n"
       "Start it with 'sub-dbd &' and stop it with 'sub-dbd --stop'.\n",
-      SUB_NAMELEN - 1, SUB_SHM_NAME, SUB_VERSION);
+      SUB_NAMELEN - 1, sub_shm_name(), SUB_VERSION);
     return 0;
 }
 

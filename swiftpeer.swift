@@ -10,7 +10,7 @@
 import Darwin
 
 // ---- the contract (see: ./bin/layout) ----
-let SHM_NAME   = "/sub.v8"
+let SHM_NAME   = ProcessInfo.processInfo.environment["SUB_SHM"].flatMap { $0.hasPrefix("/") && $0.count > 1 && $0.count < 31 ? $0 : nil } ?? "/sub.v8"
 let MAGIC:  UInt32 = 0x53554238
 let VERSION: UInt32 = 8
 let SEG_SIZE = 67141632

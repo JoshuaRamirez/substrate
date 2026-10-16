@@ -199,7 +199,7 @@ static void json_state(char *out, size_t cap) {
         "{\"count\":%llu,\"mode\":\"%s\",\"shm\":\"%s\",\"version\":%u,"
         "\"dbfile\":\"%s\",\"peers\":[",
         (unsigned long long)sub_read(&C), sub_mode(&C),
-        C.joined ? SUB_SHM_NAME : "(none)", SUB_VERSION, dbj);
+        C.joined ? sub_shm_name() : "(none)", SUB_VERSION, dbj);
 
     int first = 1;
     if (C.seg) {
