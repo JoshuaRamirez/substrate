@@ -25,6 +25,10 @@
 #include <sys/wait.h>
 #include <stdlib.h>
 #include <limits.h>
+#include <stdarg.h>
+#include <sys/file.h>
+#include <sys/time.h>
+#include <dirent.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
 #include <sys/stat.h>
@@ -33,12 +37,15 @@
 
 static substrate C;
 static pid_t g_child = 0;
+static volatile sig_atomic_t g_got_sig = 0, g_alarm = 0;
+static void on_alarm(int s) { (void)s; g_alarm = 1; }
 
 /* Forward what we are told to the thing we are supervising. The wrapper is a
  * conduit, not a policy: it does not decide that SIGTERM means stop. */
 /* The child leads its own process group (see do_run), so forward to the
  * GROUP: a service's workers are part of the service. */
 static void on_sig(int s) {
+    g_got_sig = s;
     if (g_child > 0) kill(-g_child, s);
 }
 
@@ -651,6 +658,625 @@ static int do_enabled(void) {
 
 #endif
 
+/* ---- sub change: the system-change lane ----
+ *
+ * A change to the running system (a service restarted, a launchd job loaded,
+ * a setting written) goes through one lane, one at a time, in the order the
+ * changes asked. It is a queue, not a gate: nothing is refused and nothing
+ * waits for approval. A change only waits its turn.
+ *
+ * The lane is a directory. Taking a ticket is a short critical section under
+ * flock(lane.lock): bump the number in `seq`, create queue/<ticket>.q and lock
+ * that file for the life of the process. The holder is the lowest ticket whose
+ * file is still locked. A process that dies, however it dies, drops its lock
+ * with it -- the kernel does that, not a heartbeat -- so a waiter that can lock
+ * an entry knows its owner is gone, clears it, and logs it if it was running.
+ *
+ * A stuck change does not hold the lane forever: past its timeout its own
+ * process group is sent SIGTERM, then SIGKILL, it is logged timed-out, and the
+ * next change runs. Each change is one line of changes.jsonl. */
+
+#define LANE_POLL_US   20000
+#define LANE_TIMEOUT   300
+
+typedef struct { char *p; size_t n, cap; } sbuf;
+
+static void sb_put(sbuf *b, const char *s, size_t k) {
+    if (b->n + k + 1 > b->cap) {
+        size_t c = b->cap ? b->cap : 256;
+        while (c < b->n + k + 1) c *= 2;
+        char *q = realloc(b->p, c);
+        if (!q) return;
+        b->p = q; b->cap = c;
+    }
+    memcpy(b->p + b->n, s, k); b->n += k; b->p[b->n] = 0;
+}
+static void sb_s(sbuf *b, const char *s) { sb_put(b, s, strlen(s)); }
+__attribute__((format(printf, 2, 3)))
+static void sb_f(sbuf *b, const char *fmt, ...) {
+    char t[512]; va_list ap; va_start(ap, fmt);
+    int k = vsnprintf(t, sizeof t, fmt, ap); va_end(ap);
+    if (k > 0) sb_put(b, t, (size_t)k < sizeof t ? (size_t)k : sizeof t - 1);
+}
+static void sb_json(sbuf *b, const char *s) {
+    sb_s(b, "\"");
+    for (; s && *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if (c == '"' || c == '\\') { char e[2] = { '\\', (char)c }; sb_put(b, e, 2); }
+        else if (c == '\n') sb_s(b, "\\n");
+        else if (c == '\t') sb_s(b, "\\t");
+        else if (c == '\r') sb_s(b, "\\r");
+        else if (c < 0x20)  sb_f(b, "\\u%04x", c);
+        else sb_put(b, (const char *)&c, 1);
+    }
+    sb_s(b, "\"");
+}
+
+static double now_s(void) {
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+/* Local time, milliseconds and offset: 2026-10-20T15:08:00.123-07:00 */
+static void iso_at(double t, char *out, size_t cap) {
+    time_t s = (time_t)t; struct tm tm; localtime_r(&s, &tm);
+    char base[32], z[8];
+    strftime(base, sizeof base, "%Y-%m-%dT%H:%M:%S", &tm);
+    strftime(z, sizeof z, "%z", &tm);
+    int ms = (int)((t - (double)s) * 1000); if (ms > 999) ms = 999; if (ms < 0) ms = 0;
+    snprintf(out, cap, "%s.%03d%.3s:%.2s", base, ms, z, z + 3);
+}
+
+static void lane_root(char *out, size_t cap) {
+    const char *e = getenv("SUB_LANE"), *h = getenv("HOME");
+    if (e && *e) snprintf(out, cap, "%s", e);
+    else snprintf(out, cap, "%s/Library/Application Support/substrate/changes", h ? h : "/tmp");
+}
+
+static int mkdir_p(const char *path) {
+    char t[PATH_MAX]; snprintf(t, sizeof t, "%s", path);
+    for (char *p = t + 1; *p; p++) if (*p == '/') { *p = 0; mkdir(t, 0755); *p = '/'; }
+    return (mkdir(t, 0755) == 0 || errno == EEXIST) ? 0 : -1;
+}
+
+static int on_path(const char *cmd) {
+    const char *path = getenv("PATH");
+    char buf[PATH_MAX];
+    while (path && *path) {
+        size_t k = strcspn(path, ":");
+        if (k && k < sizeof buf - strlen(cmd) - 2) {
+            snprintf(buf, sizeof buf, "%.*s/%s", (int)k, path, cmd);
+            if (access(buf, X_OK) == 0) return 1;
+        }
+        path += k + (path[k] == ':');
+    }
+    return 0;
+}
+
+/* Who asked: the desk's name for this agent ($DESK_WHOAMI, else desk-whoami,
+ * which reads desk_identity), else the herdr pane, else the login. */
+static void who_am_i(char *out, size_t cap) {
+    const char *w = getenv("DESK_WHOAMI");
+    if (w && *w) { snprintf(out, cap, "%s", w); return; }
+    if (on_path("desk-whoami")) {
+        FILE *p = popen("desk-whoami 2>/dev/null", "r");
+        if (p) {
+            char line[256] = "";
+            if (!fgets(line, sizeof line, p)) line[0] = 0;
+            int st = pclose(p);
+            line[strcspn(line, "\t\n")] = 0;
+            if (st == 0 && line[0] && strcmp(line, "unknown")) { snprintf(out, cap, "%s", line); return; }
+        }
+    }
+    const char *pane = getenv("HERDR_PANE_ID");
+    if (pane && *pane) { snprintf(out, cap, "herdr pane %s", pane); return; }
+    const char *u = getenv("USER");
+    snprintf(out, cap, "%s", u && *u ? u : "unknown");
+}
+
+typedef struct {
+    unsigned long long ticket, nested_in;
+    const char *what, *why, *undo;
+    char who[256];
+    char **cmd; int ncmd;
+    int timeout;
+    double queued, started, ended;
+    pid_t pid, pgid; uint64_t child_start;
+    const char *status; int exit_code;
+} lane_change;
+
+static void change_json(sbuf *b, const lane_change *c) {
+    char t[48];
+    sb_f(b, "{\"ticket\":%llu,\"what\":", c->ticket); sb_json(b, c->what);
+    sb_s(b, ",\"who\":");  sb_json(b, c->who);
+    sb_s(b, ",\"why\":");  sb_json(b, c->why ? c->why : "");
+    sb_s(b, ",\"undo\":"); sb_json(b, c->undo ? c->undo : "");
+    sb_s(b, ",\"cmd\":[");
+    for (int i = 0; i < c->ncmd; i++) { if (i) sb_s(b, ","); sb_json(b, c->cmd[i]); }
+    sb_s(b, "]");
+    iso_at(c->queued, t, sizeof t); sb_s(b, ",\"queued\":"); sb_json(b, t); sb_f(b, ",\"queued_s\":%.3f", c->queued);
+    if (c->started > 0) { iso_at(c->started, t, sizeof t); sb_s(b, ",\"started\":"); sb_json(b, t); sb_f(b, ",\"started_s\":%.3f", c->started); }
+    if (c->ended > 0) {
+        iso_at(c->ended, t, sizeof t); sb_s(b, ",\"ended\":"); sb_json(b, t); sb_f(b, ",\"ended_s\":%.3f", c->ended);
+        sb_s(b, ",\"status\":"); sb_json(b, c->status);
+        sb_f(b, ",\"exit\":%d", c->exit_code);
+    }
+    sb_f(b, ",\"timeout\":%d,\"pid\":%d", c->timeout, (int)c->pid);
+    if (c->pgid > 0) sb_f(b, ",\"pgid\":%d,\"child_start\":%llu", (int)c->pgid, (unsigned long long)c->child_start);
+    if (c->nested_in) sb_f(b, ",\"nested_in\":%llu", c->nested_in);
+    sb_s(b, "}");
+}
+
+static void lane_log(const char *root, const char *line, size_t n) {
+    char p[PATH_MAX]; snprintf(p, sizeof p, "%s/changes.jsonl", root);
+    int fd = open(p, O_WRONLY | O_APPEND | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) { fprintf(stderr, "sub: cannot log the change to %s: %s\n", p, strerror(errno)); return; }
+    if (write(fd, line, n) != (ssize_t)n) fprintf(stderr, "sub: short write to %s\n", p);
+    close(fd);
+}
+
+/* An entry is rewritten in place, never renamed over: the lock lives on the
+ * inode, and a new inode would read as unlocked, that is, as dead. */
+static void entry_write(int fd, const lane_change *c) {
+    if (fd < 0) return;
+    sbuf b = {0}; change_json(&b, c); sb_s(&b, "\n");
+    if (b.p) { if (ftruncate(fd, 0) == 0 && pwrite(fd, b.p, b.n, 0) < 0) { /* display only */ } }
+    free(b.p);
+}
+
+static char *read_fd(int fd) {
+    sbuf b = {0}; char t[4096]; ssize_t k; off_t off = 0;
+    while ((k = pread(fd, t, sizeof t, off)) > 0) { sb_put(&b, t, (size_t)k); off += k; }
+    if (!b.p) sb_s(&b, "");
+    return b.p;
+}
+
+/* A string field of one JSON line we wrote ourselves. Inside a value every
+ * quote is escaped, so "key":" can only match the key itself. */
+static int jstr(const char *line, const char *key, char *out, size_t cap) {
+    char pat[64]; snprintf(pat, sizeof pat, "\"%s\":\"", key);
+    const char *p = strstr(line, pat);
+    out[0] = 0;
+    if (!p) return 0;
+    p += strlen(pat);
+    size_t k = 0;
+    while (*p && *p != '"' && k + 1 < cap) {
+        if (*p == '\\' && p[1]) {
+            p++;
+            if (*p == 'u') { out[k++] = '?'; p += (strlen(p) >= 5) ? 5 : strlen(p); continue; }
+            out[k++] = (*p == 'n' || *p == 't' || *p == 'r') ? ' ' : *p;
+            p++; continue;
+        }
+        out[k++] = *p++;
+    }
+    out[k] = 0;
+    return 1;
+}
+static double jnum(const char *line, const char *key, double dflt) {
+    char pat[64]; snprintf(pat, sizeof pat, "\"%s\":", key);
+    const char *p = strstr(line, pat);
+    if (!p) return dflt;
+    p += strlen(pat);
+    if (*p == 'n' || *p == '"') return dflt;
+    return strtod(p, NULL);
+}
+
+static int cmp_ull(const void *a, const void *b) {
+    unsigned long long x = *(const unsigned long long *)a, y = *(const unsigned long long *)b;
+    return x < y ? -1 : x > y;
+}
+
+/* The tickets in the queue, ascending. Caller frees. */
+static int queue_tickets(const char *root, unsigned long long **out) {
+    char q[PATH_MAX]; snprintf(q, sizeof q, "%s/queue", root);
+    *out = NULL;
+    DIR *d = opendir(q);
+    if (!d) return 0;
+    int n = 0, cap = 0; struct dirent *e;
+    while ((e = readdir(d))) {
+        size_t L = strlen(e->d_name);
+        if (L < 3 || strcmp(e->d_name + L - 2, ".q") || !isdigit((unsigned char)e->d_name[0])) continue;
+        if (n == cap) { cap = cap ? cap * 2 : 16; unsigned long long *t = realloc(*out, cap * sizeof **out); if (!t) break; *out = t; }
+        (*out)[n++] = strtoull(e->d_name, NULL, 10);
+    }
+    closedir(d);
+    if (n) qsort(*out, (size_t)n, sizeof **out, cmp_ull);
+    return n;
+}
+
+static void entry_path(const char *root, unsigned long long t, char *out, size_t cap) {
+    snprintf(out, cap, "%s/queue/%012llu.q", root, t);
+}
+
+/* Is this entry's owner alive? Its lock answers: a lock we can take is one
+ * nobody holds. Returns 1 alive, 0 dead (with *fdp left open AND locked, so
+ * the caller can bury it), -1 gone. */
+static int entry_alive(const char *path, int *fdp) {
+    int fd = open(path, O_RDWR | O_CLOEXEC);
+    if (fd < 0) fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) == 0) {
+        /* Opened before its owner unlinked it and locked after the owner
+         * closed it: that is a change that ended cleanly, not a dead one.
+         * Only the file still at this path counts. */
+        struct stat a, b;
+        if (fstat(fd, &a) != 0 || stat(path, &b) != 0 || a.st_ino != b.st_ino || a.st_dev != b.st_dev) {
+            close(fd);
+            return -1;
+        }
+        if (fdp) *fdp = fd; else close(fd);
+        return 0;
+    }
+    close(fd);
+    return 1;
+}
+
+/* A dead owner's entry: what it was running is stopped (its own group, and
+ * only if that group is still the one it started), the change is logged
+ * holder-died, and the entry goes. Called under the lane lock. */
+static void lane_bury(const char *root, int fd, const char *path) {
+    char *body = read_fd(fd);
+    if (strstr(body, "\"started\":")) {
+        pid_t pg = (pid_t)jnum(body, "pgid", 0);
+        uint64_t st = (uint64_t)jnum(body, "child_start", 0);
+        /* Ours if the group still exists and its leader is the process the
+         * change started, or is gone (a pid is not reused while it names a
+         * live group, so a leaderless group of that number is still ours). */
+        uint64_t now_start = sub_proc_start(pg);
+        if (pg > 1 && st && kill(-pg, 0) == 0 && (now_start == st || (now_start == 0 && kill(pg, 0) != 0))) {
+            kill(-pg, SIGTERM);
+            for (int i = 0; i < 50 && kill(-pg, 0) == 0; i++) usleep(10000);
+            kill(-pg, SIGKILL);
+        }
+        size_t L = strlen(body);
+        while (L && (body[L - 1] == '\n' || body[L - 1] == ' ')) L--;
+        if (L && body[L - 1] == '}') {
+            sbuf b = {0}; char t[48]; double now = now_s();
+            sb_put(&b, body, L - 1);
+            iso_at(now, t, sizeof t);
+            sb_s(&b, ",\"ended\":"); sb_json(&b, t);
+            sb_f(&b, ",\"ended_s\":%.3f,\"status\":\"holder-died\",\"exit\":null}\n", now);
+            lane_log(root, b.p, b.n);
+            free(b.p);
+        }
+    }
+    free(body);
+    unlink(path);
+    close(fd);
+}
+
+/* Under the lane lock: how many live changes are ahead of ticket `mine`.
+ * Dead ones met on the way are buried. Stops at the first live one. */
+static int lane_ahead(const char *root, unsigned long long mine, unsigned long long *first) {
+    unsigned long long *t = NULL;
+    int n = queue_tickets(root, &t), live = 0;
+    for (int i = 0; i < n && t[i] < mine; i++) {
+        char p[PATH_MAX]; entry_path(root, t[i], p, sizeof p);
+        int fd = -1, a = entry_alive(p, &fd);
+        if (a == 0) { lane_bury(root, fd, p); continue; }
+        if (a == 1) { live = 1; if (first) *first = t[i]; break; }
+    }
+    free(t);
+    return live;
+}
+
+static unsigned long long next_ticket(const char *root) {
+    char p[PATH_MAX]; snprintf(p, sizeof p, "%s/seq", root);
+    int fd = open(p, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (fd < 0) return (unsigned long long)(now_s() * 1000);
+    char buf[32] = ""; ssize_t k = pread(fd, buf, sizeof buf - 1, 0);
+    unsigned long long n = k > 0 ? strtoull(buf, NULL, 10) : 0;
+    n++;
+    int w = snprintf(buf, sizeof buf, "%llu\n", n);
+    if (ftruncate(fd, 0) != 0 || pwrite(fd, buf, (size_t)w, 0) != w) { /* the entry's O_EXCL still keeps tickets unique */ }
+    close(fd);
+    return n;
+}
+
+/* Run the change: its own process group, a deadline, then the log line. */
+static int lane_run(lane_change *c, const char *root, int efd, const char *epath) {
+    c->started = now_s();
+    char tk[32]; snprintf(tk, sizeof tk, "%llu", c->nested_in ? c->nested_in : c->ticket);
+    /* The child execs only once its process group is on record in the entry:
+     * it waits on a pipe for the go. If this process dies first, the pipe
+     * reads EOF and the child leaves without running anything, so there is
+     * never a change running that a waiter could not find and stop. */
+    int gate[2];
+    if (pipe(gate) != 0) { perror("sub: pipe"); c->exit_code = 1; c->status = "failed"; goto done; }
+    fcntl(gate[0], F_SETFD, FD_CLOEXEC); fcntl(gate[1], F_SETFD, FD_CLOEXEC);
+    pid_t kid = fork();
+    if (kid < 0) { perror("sub: fork"); close(gate[0]); close(gate[1]); c->exit_code = 1; c->status = "failed"; goto done; }
+    if (kid == 0) {
+        setpgid(0, 0);
+        signal(SIGTERM, SIG_DFL); signal(SIGINT, SIG_DFL); signal(SIGHUP, SIG_DFL);
+        close(gate[1]);
+        char go = 0; ssize_t k;
+        while ((k = read(gate[0], &go, 1)) < 0 && errno == EINTR) { }
+        if (k != 1) _exit(125);
+        close(gate[0]);
+        /* a change that makes a change runs inside this one, not behind it */
+        setenv("SUB_CHANGE_TICKET", tk, 1);
+        setenv("SUB_CHANGE_LANE", root, 1);
+        execvp(c->cmd[0], c->cmd);
+        fprintf(stderr, "sub: cannot exec %s: %s\n", c->cmd[0], strerror(errno));
+        _exit(127);
+    }
+    setpgid(kid, kid);
+    g_child = kid;
+    c->pgid = kid; c->child_start = sub_proc_start(kid);
+    entry_write(efd, c);
+    signal(SIGTERM, on_sig); signal(SIGINT, on_sig); signal(SIGHUP, on_sig);
+    close(gate[0]);
+    if (write(gate[1], "g", 1) != 1) { /* the child is gone already; waitpid says how */ }
+    close(gate[1]);
+
+    /* Block in waitpid; the deadline is a timer that interrupts it (and
+     * keeps interrupting every second, so a tick that lands just before
+     * the wait cannot be lost). No polling: a free lane costs a fork. */
+    struct sigaction sa; memset(&sa, 0, sizeof sa);
+    sa.sa_handler = on_alarm; sigemptyset(&sa.sa_mask);          /* no SA_RESTART */
+    sigaction(SIGALRM, &sa, NULL);
+    struct itimerval it = { { 1, 0 }, { c->timeout, 0 } };
+    g_alarm = 0;
+    setitimer(ITIMER_REAL, &it, NULL);
+    double deadline = c->started + c->timeout;
+    int st = 0, timed = 0, reaped = 0;
+    for (;;) {
+        pid_t r = waitpid(kid, &st, 0);
+        if (r == kid) { reaped = 1; break; }
+        if (r < 0 && errno != EINTR) break;
+        if (g_alarm && now_s() >= deadline) {
+            struct itimerval off = { { 0, 0 }, { 0, 0 } };
+            setitimer(ITIMER_REAL, &off, NULL);
+            timed = 1;
+            fprintf(stderr, "sub: change #%llu (%s) passed its %ds -- stopping its process group\n",
+                    c->ticket, c->what, c->timeout);
+            kill(-kid, SIGTERM);
+            for (int i = 0; i < 40; i++) {
+                if (waitpid(kid, &st, WNOHANG) == kid) { reaped = 1; break; }
+                usleep(50000);
+            }
+            kill(-kid, SIGKILL);      /* whatever of the group is left, leader or not */
+            if (!reaped) while (waitpid(kid, &st, 0) < 0 && errno == EINTR) { }
+            reaped = 1;
+            break;
+        }
+    }
+    { struct itimerval off = { { 0, 0 }, { 0, 0 } }; setitimer(ITIMER_REAL, &off, NULL); }
+    g_child = 0;
+    if (timed) { c->exit_code = 124; c->status = "timed-out"; }
+    else {
+        c->exit_code = !reaped ? 1 : WIFSIGNALED(st) ? 128 + WTERMSIG(st) : WEXITSTATUS(st);
+        c->status = g_got_sig ? "interrupted" : c->exit_code == 0 ? "ok" : "failed";
+    }
+done:
+    c->ended = now_s();
+    {
+        sbuf b = {0}; change_json(&b, c); sb_s(&b, "\n");
+        if (b.p) lane_log(root, b.p, b.n);
+        free(b.p);
+    }
+    /* unlink before close: closed first, a waiter could lock it and bury a
+     * change that ended cleanly */
+    if (epath) unlink(epath);
+    if (efd >= 0) close(efd);
+    return c->exit_code;
+}
+
+/* Queue the change, wait its turn, run it. Never refuses: a lane that
+ * cannot be made still runs the change, unqueued, and says so. */
+static int lane_change_run(lane_change *c) {
+    char root[PATH_MAX], q[PATH_MAX];
+    lane_root(root, sizeof root);
+    snprintf(q, sizeof q, "%s/queue", root);
+    if (c->timeout <= 0) c->timeout = LANE_TIMEOUT;
+    c->pid = getpid();
+    c->queued = now_s();
+    who_am_i(c->who, sizeof c->who);
+
+    int lk = -1;
+    char lp[PATH_MAX]; snprintf(lp, sizeof lp, "%s/lane.lock", root);
+    if (mkdir_p(q) == 0) lk = open(lp, O_RDWR | O_CREAT | O_CLOEXEC, 0644);
+    if (lk < 0) {
+        fprintf(stderr, "sub: no lane at %s (%s) -- running the change unqueued\n", root, strerror(errno));
+        return lane_run(c, root, -1, NULL);
+    }
+
+    while (flock(lk, LOCK_EX) < 0 && errno == EINTR) { }
+    c->ticket = next_ticket(root);
+
+    /* Already inside a running change (a change whose command makes a
+     * change)? Then this one is part of it: run now, logged as nested. */
+    const char *outer = getenv("SUB_CHANGE_TICKET"), *olane = getenv("SUB_CHANGE_LANE");
+    if (outer && olane && !strcmp(olane, root)) {
+        char op[PATH_MAX]; entry_path(root, strtoull(outer, NULL, 10), op, sizeof op);
+        if (entry_alive(op, NULL) == 1) {
+            c->nested_in = strtoull(outer, NULL, 10);
+            flock(lk, LOCK_UN); close(lk);
+            return lane_run(c, root, -1, NULL);
+        }
+    }
+
+    char ep[PATH_MAX]; int efd = -1;
+    for (int tries = 0; tries < 1000; tries++) {
+        entry_path(root, c->ticket, ep, sizeof ep);
+        efd = open(ep, O_RDWR | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+        if (efd >= 0 || errno != EEXIST) break;
+        c->ticket++;                      /* seq was reset under a stale entry */
+    }
+    if (efd < 0) {
+        flock(lk, LOCK_UN); close(lk);
+        fprintf(stderr, "sub: cannot queue at %s (%s) -- running the change unqueued\n", ep, strerror(errno));
+        return lane_run(c, root, -1, NULL);
+    }
+    flock(efd, LOCK_EX);
+    entry_write(efd, c);
+    flock(lk, LOCK_UN);
+
+    int told = 0;
+    for (;;) {
+        unsigned long long first = 0;
+        while (flock(lk, LOCK_EX) < 0 && errno == EINTR) { }
+        int ahead = lane_ahead(root, c->ticket, &first);
+        flock(lk, LOCK_UN);
+        if (!ahead) break;
+        if (!told++) fprintf(stderr, "sub: change #%llu (%s) waits its turn behind #%llu\n", c->ticket, c->what, first);
+        usleep(LANE_POLL_US);
+    }
+    close(lk);
+    return lane_run(c, root, efd, ep);
+}
+
+static int do_change(int argc, char **argv) {
+    lane_change c = {0};
+    int i = 0;
+    for (i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--")) { i++; break; }
+        else if (!strcmp(argv[i], "--undo") && i + 1 < argc) c.undo = argv[++i];
+        else if (!strcmp(argv[i], "--why") && i + 1 < argc) c.why = argv[++i];
+        else if (!strcmp(argv[i], "--timeout") && i + 1 < argc) c.timeout = atoi(argv[++i]);
+        else if (argv[i][0] != '-' && !c.what) c.what = argv[i];
+        else { fprintf(stderr, "sub change: unknown option %s\n", argv[i]); return 2; }
+    }
+    if (!c.what || !*c.what || i >= argc) {
+        fprintf(stderr, "usage: sub change \"<what>\" [--undo \"<cmd>\"] [--why \"<why>\"] [--timeout SECONDS] -- cmd [args]\n");
+        return 2;
+    }
+    c.cmd = &argv[i]; c.ncmd = argc - i;
+    return lane_change_run(&c);
+}
+
+static int my_exe(char *out, size_t cap, const char *argv0) {
+#if defined(__APPLE__)
+    uint32_t n = (uint32_t)cap;
+    if (_NSGetExecutablePath(out, &n) == 0) return 0;
+#else
+    ssize_t k = readlink("/proc/self/exe", out, cap - 1);
+    if (k > 0) { out[k] = 0; return 0; }
+#endif
+    snprintf(out, cap, "%s", argv0);
+    return 0;
+}
+
+/* Inside a running change already? Then a verb that changes the system is
+ * part of that change, and runs as it is. */
+static int inside_change(void) {
+    const char *outer = getenv("SUB_CHANGE_TICKET"), *olane = getenv("SUB_CHANGE_LANE");
+    char root[PATH_MAX]; lane_root(root, sizeof root);
+    if (!outer || !olane || strcmp(olane, root)) return 0;
+    char op[PATH_MAX]; entry_path(root, strtoull(outer, NULL, 10), op, sizeof op);
+    return entry_alive(op, NULL) == 1;
+}
+
+/* sub enable / disable / stop change the running system, so they go through
+ * the lane: this process re-runs itself as the change's command. */
+static int through_lane(int argc, char **argv, const char *what, const char *undo) {
+    char me[PATH_MAX]; my_exe(me, sizeof me, argv[0]);
+    char **cmd = calloc((size_t)argc + 1, sizeof *cmd);
+    if (!cmd) return 1;
+    cmd[0] = me;
+    for (int k = 1; k < argc; k++) cmd[k] = argv[k];
+    lane_change c = {0};
+    c.what = what; c.undo = undo; c.cmd = cmd; c.ncmd = argc;
+    int rc = lane_change_run(&c);
+    free(cmd);
+    return rc;
+}
+
+/* sub restart NAME: kickstart -k the agent sub enable made (or a full
+ * launchd label), through the lane. */
+static int do_restart(int argc, char **argv) {
+    int timeout = 0; const char *name = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--timeout") && i + 1 < argc) timeout = atoi(argv[++i]);
+        else if (argv[i][0] != '-' && !name) name = argv[i];
+        else { fprintf(stderr, "sub restart: unknown option %s\n", argv[i]); return 2; }
+    }
+    if (!name || !*name || strchr(name, '/')) { fprintf(stderr, "usage: sub restart [--timeout SECONDS] NAME|LABEL\n"); return 2; }
+    char label[256], plist[PATH_MAX], tgt[320], what[300];
+    if (strchr(name, '.')) snprintf(label, sizeof label, "%s", name);
+    else {
+        snprintf(label, sizeof label, "dev.substrate.%s", name);
+        const char *h = getenv("HOME");
+        snprintf(plist, sizeof plist, "%s/Library/LaunchAgents/%s.plist", h ? h : "", label);
+        if (access(plist, F_OK) != 0) {
+            fprintf(stderr, "sub: %s is not enabled (no %s) -- restart restarts what 'sub enable' set up\n", name, plist);
+            return 2;
+        }
+    }
+    snprintf(tgt, sizeof tgt, "gui/%u/%s", getuid(), label);
+    snprintf(what, sizeof what, "restart %s", name);
+    const char *lc = getenv("SUB_LAUNCHCTL");
+    char lcb[PATH_MAX]; snprintf(lcb, sizeof lcb, "%s", lc && *lc ? lc : "launchctl");
+    char v1[] = "kickstart", v2[] = "-k";
+    char *cmd[] = { lcb, v1, v2, tgt, NULL };
+    lane_change c = {0};
+    c.what = what; c.cmd = cmd; c.ncmd = 4; c.timeout = timeout;
+    return lane_change_run(&c);
+}
+
+/* sub changes [--last N] [--json] | --running */
+static int do_changes(int argc, char **argv) {
+    int last = 20, json = 0, running = 0;
+    for (int i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--last") && i + 1 < argc) last = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--json")) json = 1;
+        else if (!strcmp(argv[i], "--running")) running = 1;
+        else { fprintf(stderr, "usage: sub changes [--last N] [--json] | --running\n"); return 2; }
+    }
+    char root[PATH_MAX]; lane_root(root, sizeof root);
+    double now = now_s();
+    if (running) {
+        unsigned long long *t = NULL;
+        int n = queue_tickets(root, &t), shown = 0;
+        for (int i = 0; i < n; i++) {
+            char p[PATH_MAX]; entry_path(root, t[i], p, sizeof p);
+            int fd = open(p, O_RDONLY | O_CLOEXEC);
+            if (fd < 0) continue;
+            if (flock(fd, LOCK_EX | LOCK_NB) == 0) { close(fd); continue; }   /* nobody holds it: gone */
+            char *body = read_fd(fd); close(fd);
+            char what[256], who[128];
+            jstr(body, "what", what, sizeof what); jstr(body, "who", who, sizeof who);
+            double st = jnum(body, "started_s", 0), qd = jnum(body, "queued_s", now);
+            if (st > 0) printf("running  #%-6llu %7.1fs  %-24.24s  %s\n", t[i], now - st, who, what);
+            else        printf("waiting  #%-6llu %7.1fs  %-24.24s  %s\n", t[i], now - qd, who, what);
+            free(body); shown++;
+        }
+        free(t);
+        if (!shown) printf("(no change running)\n");
+        return 0;
+    }
+    char p[PATH_MAX]; snprintf(p, sizeof p, "%s/changes.jsonl", root);
+    int fd = open(p, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) { printf("(no changes logged in %s)\n", p); return 0; }
+    char *all = read_fd(fd); close(fd);
+    /* the start of the last `last` lines */
+    size_t L = strlen(all); int seen = 0; size_t from = 0;
+    if (last > 0) {
+        for (size_t k = L; k > 0; k--) {
+            if (all[k - 1] == '\n' && k != L && ++seen == last) { from = k; break; }
+        }
+    }
+    for (char *line = all + from, *nl; line && *line; line = nl ? nl + 1 : NULL) {
+        nl = strchr(line, '\n'); if (nl) *nl = 0;
+        if (!*line) continue;
+        if (json) { printf("%s\n", line); continue; }
+        char what[256], who[128], status[24], when[48];
+        jstr(line, "what", what, sizeof what); jstr(line, "who", who, sizeof who);
+        jstr(line, "status", status, sizeof status);
+        if (!jstr(line, "started", when, sizeof when)) jstr(line, "queued", when, sizeof when);
+        if (strlen(when) >= 19) { when[19] = 0; if (when[10] == 'T') when[10] = ' '; }
+        double st = jnum(line, "started_s", 0), en = jnum(line, "ended_s", 0);
+        char ex[16]; double e = jnum(line, "exit", -1e9);
+        if (e < -1e8) snprintf(ex, sizeof ex, "-"); else snprintf(ex, sizeof ex, "%d", (int)e);
+        printf("#%-6llu %s  %-11s %4s %7.1fs  %-24.24s  %s\n",
+               (unsigned long long)jnum(line, "ticket", 0), when, status, ex,
+               st > 0 && en >= st ? en - st : 0.0, who, what);
+    }
+    free(all);
+    return 0;
+}
+
 static int usage(void) {
     printf(
       "sub -- register and manage the things you run on this machine\n"
@@ -683,10 +1309,22 @@ static int usage(void) {
       "  sub stop [--force] NAME|PID\n"
       "        SIGTERM it and everything it forked, wait up to 10s.\n"
       "        --force: SIGKILL whatever is left after that.\n"
+      "  sub restart [--timeout S] NAME|LABEL\n"
+      "        launchctl kickstart -k the agent 'sub enable' made (or a full\n"
+      "        launchd label), as a change through the lane.\n"
+      "  sub change \"<what>\" [--undo \"<cmd>\"] [--why \"<why>\"] [--timeout S] -- cmd [args...]\n"
+      "        A change to the running system: queued, run one at a time in\n"
+      "        arrival order, logged. A queue, not a gate -- nothing is refused.\n"
+      "        Past --timeout (default %ds) its process group is killed, it is\n"
+      "        logged timed-out (exit 124), and the next change runs. enable,\n"
+      "        disable, stop and restart go through the same lane.\n"
+      "  sub changes [--last N] [--json] | --running\n"
+      "        The change log, or the change running now and the queue behind it.\n"
+      "        Lane: $SUB_LANE, else ~/Library/Application Support/substrate/changes.\n"
       "\n"
       "The registry is the segment %s (format v%u), owned by sub-dbd.\n"
       "Start it with 'sub-dbd &' and stop it with 'sub-dbd --stop'.\n",
-      SUB_NAMELEN - 1, sub_shm_name(), SUB_VERSION);
+      SUB_NAMELEN - 1, LANE_TIMEOUT, sub_shm_name(), SUB_VERSION);
     return 0;
 }
 
@@ -694,10 +1332,31 @@ int main(int argc, char **argv) {
     if (argc < 2) return usage();
     if (!strcmp(argv[1], "ps"))   return do_ps();
     if (!strcmp(argv[1], "run"))  return do_run(argc - 2, argv + 2);
-    if (!strcmp(argv[1], "enable"))  return do_enable(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "change"))  return do_change(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "changes")) return do_changes(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "restart")) return do_restart(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "enable")) {
+        if (!inside_change() && argc > 2) {
+            /* what: "enable NAME", NAME as do_enable would choose it */
+            const char *nm = NULL;
+            for (int k = 2; k < argc; k++) {
+                if (!strcmp(argv[k], "--")) { if (!nm && k + 1 < argc) nm = base_of(argv[k + 1]); break; }
+                if (!strcmp(argv[k], "--name") && k + 1 < argc) { nm = argv[k + 1]; break; }
+            }
+            char what[200], undo[200];
+            snprintf(what, sizeof what, "enable %s", nm ? nm : "?");
+            snprintf(undo, sizeof undo, "sub disable %s", nm ? nm : "?");
+            return through_lane(argc, argv, what, undo);
+        }
+        return do_enable(argc - 2, argv + 2);
+    }
     if (!strcmp(argv[1], "enabled")) return do_enabled();
     if (!strcmp(argv[1], "disable")) {
         if (argc < 3) { fprintf(stderr, "usage: sub disable NAME\n"); return 2; }
+        if (!inside_change()) {
+            char what[200]; snprintf(what, sizeof what, "disable %s", argv[2]);
+            return through_lane(argc, argv, what, NULL);
+        }
         return do_disable(argv[2]);
     }
     if (!strcmp(argv[1], "stop")) {
@@ -705,6 +1364,10 @@ int main(int argc, char **argv) {
         if (argc < 3 + force) {
             fprintf(stderr, "usage: sub stop [--force] NAME|PID\n");
             return 2;
+        }
+        if (!inside_change()) {
+            char what[200]; snprintf(what, sizeof what, "stop %s", argv[2 + force]);
+            return through_lane(argc, argv, what, NULL);
         }
         return do_stop(argv[2 + force], force);
     }

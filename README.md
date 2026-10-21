@@ -244,6 +244,43 @@ services relative to each other, back off on crash loops beyond launchd's own
 only — on Linux it refuses and points at systemd user units, which are not
 written.
 
+### Changes to the running system: one lane, one at a time
+
+```sh
+sub change "restart reports-page" --undo "sub restart reports-page" \
+           --why "picked up the new build" -- sub restart reports-page
+sub changes --last 5        # the log; --json for the raw lines
+sub changes --running       # the change running now, and the queue behind it
+```
+
+A restart, a launchd job loaded or unloaded, a setting written: each is a
+change to what is running, and two of them at once can step on each other.
+`sub change` runs them one at a time, in the order they asked. It is a queue,
+not a gate: nothing is refused and nothing waits for approval; a change only
+waits its turn. `sub restart`, `enable`, `disable` and `stop` go through the
+same lane on their own. Code, tests and builds do not belong here.
+
+The lane is a directory (`$SUB_LANE`, else
+`~/Library/Application Support/substrate/changes`). A ticket is taken under
+`flock(lane.lock)`: the number in `seq` is bumped and `queue/<ticket>.q` is
+created and locked for the life of the process. The holder is the lowest
+ticket whose file is still locked. A process that dies, however it dies,
+drops its lock with it, so a waiter that *can* lock an entry knows its owner
+is gone: it stops what that change was running (its own process group, if it
+is still the one it started), logs it `holder-died`, and moves on.
+
+Each change is one line of `changes.jsonl`: `ticket`, `what`, `who` (`$DESK_WHOAMI`,
+else `desk-whoami`, else the herdr pane, else the login), `why`, `undo`, `cmd`
+(argv), `queued`/`started`/`ended` (local ISO time, and `_s` epoch seconds),
+`status` (`ok`, `failed`, `timed-out`, `interrupted`, `holder-died`), `exit`,
+`timeout`, `pid`, `pgid`, and `nested_in` when a change ran inside another.
+A stuck change is stopped past its `--timeout` (default 300 s): SIGTERM to its
+process group, SIGKILL two seconds later, logged `timed-out` with exit 124,
+and the next change runs. A change whose command makes a change (`sub change …
+-- sub restart x`) runs the inner one inside it rather than behind it, which
+would wait forever. The lane costs well under half a second when it is free;
+the suite measures it.
+
 ## Uninstall it
 
 ```sh

@@ -6,6 +6,9 @@ PORT=8099
 # every service enabled on it, which re-joins any owner that appears there)
 # is never touched, so the counts here are the suite's alone.
 export SUB_SHM=/sub.test.$$
+# Its own change lane too: enable, disable, stop and restart go through
+# `sub change`, and the suite's changes are not the machine's to log.
+export SUB_LANE="$(mktemp -d /tmp/sublane.XXXXXX)" DESK_WHOAMI="substrate-suite"
 fail=0
 ok()   { printf "  PASS  %s\n" "$1"; }
 bad()  { printf "  FAIL  %s\n" "$1"; fail=1; }
@@ -720,6 +723,9 @@ else
   for n in subev subat subhr subenv subapp; do launchctl bootout "gui/$(id -u)/dev.substrate.$n" 2>/dev/null; done
   rm -rf "$TH"
 fi
+echo
+
+./test-change.sh || fail=1
 echo
 
 rm -f substrate.db
