@@ -728,6 +728,9 @@ echo
 ./test-change.sh || fail=1
 echo
 
+./test-net.sh || fail=1
+echo
+
 rm -f substrate.db
 [ $fail -eq 0 ] && echo "\nALL PASS" || echo "\nFAILURES"
 exit $fail

@@ -51,7 +51,7 @@ else
 endif
 
 # Built and shipped.
-PROGS  = bin/dbd bin/sub bin/webd bin/look bin/layout bin/bench $(COCOA)
+PROGS  = bin/dbd bin/sub bin/net bin/webd bin/look bin/layout bin/bench $(COCOA)
 # Built, not shipped: fixtures that exist to be run by test.sh.
 FIXTURES = bin/mkdb bin/storm bin/wedge bin/hog bin/blobbench bin/peer
 
@@ -89,6 +89,8 @@ bin/storm:     storm.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/wedge:     wedge.c     substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/hog:       hog.c       substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 bin/peer:      peer.c      substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
+# The network adapter: threads, one per connection, so -pthread (glibc wants it said).
+bin/net:       net.c       substrate.h | bin ; $(CC) $(ALL_CFLAGS) -pthread $< -o $@
 bin/blobbench: blobbench.c substrate.h | bin ; $(CC) $(ALL_CFLAGS) $< -o $@
 
 bin/webd: webd.c substrate.h emdb.h $(EMBED_DEP) | bin
@@ -135,11 +137,12 @@ distclean: clean
 # Installed under a "sub-" prefix, and not out of tidiness: this repo builds
 # programs called `top` and `look`, and both of those are real commands that
 # already live on the PATH. Installing them bare would shadow them.
-INSTALLED = sub sub-dbd sub-webd sub-look sub-layout sub-bench
+INSTALLED = sub sub-net sub-dbd sub-webd sub-look sub-layout sub-bench
 
 install: all
 	$(INSTALL) -d $(bindir) $(includedir)
 	$(INSTALL) -m 755 bin/sub    $(bindir)/sub
+	$(INSTALL) -m 755 bin/net    $(bindir)/sub-net
 	$(INSTALL) -m 755 bin/dbd    $(bindir)/sub-dbd
 	$(INSTALL) -m 755 bin/webd   $(bindir)/sub-webd
 	$(INSTALL) -m 755 bin/look   $(bindir)/sub-look
@@ -175,7 +178,7 @@ uninstall:
 	-@$(MAKE) --no-print-directory stop
 	-@if [ -x $(bindir)/sub-dbd ]; then $(bindir)/sub-dbd --unlink; \
 	  elif [ -x bin/dbd ]; then ./bin/dbd --unlink; fi
-	rm -f $(bindir)/sub $(bindir)/sub-dbd $(bindir)/sub-webd $(bindir)/sub-look \
+	rm -f $(bindir)/sub $(bindir)/sub-net $(bindir)/sub-dbd $(bindir)/sub-webd $(bindir)/sub-look \
 	      $(bindir)/sub-layout $(bindir)/sub-bench $(bindir)/sub-pypeer \
 	      $(bindir)/sub-gui $(bindir)/sub-top $(bindir)/sub-swiftpeer
 	rm -f $(includedir)/substrate.h

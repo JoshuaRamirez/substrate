@@ -613,10 +613,105 @@ not a convention — the kernel enforces it.
 
 ## Another machine
 
-Not a gap: a *boundary*. Shared memory is single-machine by construction, and
-no amount of work here changes that. `webd` already **is** the bridge, and the
-cost of crossing it is measured above: TCP loopback is 30–50 µs against the
-ring's 0.5–2 µs, so anything remote pays roughly 30× before it leaves the box.
+Shared memory is single-machine by construction, and nothing here pretends
+otherwise: no pointer ever points across a wire. What crosses is an
+**adapter** in front of each machine's own segment. `sub-net serve` hands that
+machine's registry, process control and events to the machines it trusts, over
+one persistent, authenticated, encrypted connection per caller. The other side
+reads them as messages, never as memory.
+
+```sh
+# once per machine
+sub-net keygen                                  # key pair in the net folder
+sub-net trust pc pc.pub --at 10.0.0.2:7341      # pc's key.pub, and where pc is
+sub-net serve --bind 10.0.0.1:7341              # this machine, on the private link
+
+# then, from either side
+sub-net ps pc                                   # pc's registry
+sub-net run pc --name worker -- ./worker        # start a process there
+sub-net stop pc worker                          # and stop it (through pc's change lane)
+sub-net events pc                               # pc's events, pushed as they happen
+sub-net listen warp -- ./cell-runner            # serve a named channel here
+sub-net connect pc warp                         # talk to the one on pc
+```
+
+`sub net …` and `sub keygen` run the same thing.
+
+**Live means pushed.** `sub-net events` holds one connection open and is told:
+`join`, `leave`, `update`, `ops`, `count` and `registry`, one JSON object a
+line. Each carries `seq` (the serving machine's own, without gaps for a
+subscriber) and the segment's clocks at that moment, `count` and `next_id`, so
+a reader can order an event against anything else that machine said. The
+server finds out by reading its own peer table every 10 ms, which is a read of
+a page it already has mapped. A row is reported once it has held still for one
+scan, because a claim writes `state` before `name`.
+
+**Channels** are for work that is not process control: a Warp Drive cell
+placed on another machine, its events and its `done` coming back. `sub-net
+listen NAME -- cmd` serves a channel on this machine, and `cmd`'s stdin and
+stdout *are* the channel, one JSON value a line. `sub-net connect MACHINE NAME`
+is the other end: stdin lines go out and the listener's lines come back. A
+line that is not JSON arrives as a JSON string. The listener speaks to the
+local daemon over a unix socket in the net folder, so the trust boundary on
+that side is the same as the segment's, which is the file mode.
+
+**The seam.** `substrate.h` declares `sub_net_transport`: listen, accept,
+dial, send, recv, and the rest, a struct of pointers that carries whole frames
+between two authenticated machines. A transport promises that a frame arrives
+whole or not at all, in order, from the machine whose key accept() named, and
+that nobody in between reads it. `net.c` fills it with the one transport
+shipped. Another transport (a different suite, a serial line, a QUIC stream)
+is another struct, and the protocol above it does not change.
+
+**The transport** is `Noise_IK_25519_ChaChaPoly_SHA256` over TCP. Every machine
+is known by an X25519 key. The caller proves its key and the server proves its
+own in the same two messages, and each direction then gets its own
+ChaCha20-Poly1305 key. The ephemeral keys die with the handshake, so a key
+stolen later does not open traffic recorded earlier. A caller whose key is
+not on the trust list is refused after the first message, and a server that
+cannot prove the key trusted under its name is refused by the caller.
+
+The cipher suite is **implemented in this repo**, in `net.c`, like everything
+else here: no libsodium, no OpenSSL, no third-party code. That is a choice
+with a cost, so it is checked: `sub-net selftest` runs every primitive against
+the vectors its standard publishes, and the suite runs it.
+
+| Primitive | Checked against |
+|---|---|
+| SHA-256 | FIPS 180-2: `abc`, and the two-block message |
+| HMAC-SHA-256 | RFC 4231, test case 2 |
+| ChaCha20 | RFC 8439 §2.3.2, the block function |
+| Poly1305 | RFC 8439 §2.5.2 |
+| ChaCha20-Poly1305 | RFC 8439 §2.8.2, ciphertext and tag |
+| X25519 | RFC 7748 §5.2, and §6.1 both public keys and the shared secret |
+
+Plus two that are properties, not vectors: a sealed frame with one flipped
+bit is refused, and a low-order public key (which makes every shared secret
+zero) is refused.
+
+**Where it listens.** `--bind` names exactly one address, and it must be
+loopback or private: 127/8, 10/8, 172.16/12, 192.168/16, 100.64/10 (what a
+private overlay network hands out), 169.254/16, `::1`, `fc00::/7`, `fe80::/10`.
+`0.0.0.0`, `::` and every public address are refused. This serves process
+control, and process control does not belong on the internet.
+
+**Keys** live in the net folder: `$SUB_NET_DIR`, else
+`~/Library/Application Support/substrate/net` on macOS and
+`~/.config/substrate/net` elsewhere. `key` is the secret half, mode 0600;
+`key.pub` is the half other machines are given; `peers` is the trust list,
+one line per machine, `name pubkey [address:port]`. No key is ever printed,
+logged or written into the repo, and the suite checks that.
+
+`./test-net.sh` is the proof on one machine: two segments, two owners, two
+`sub-net serve`s on 127.0.0.1 with two throwaway key pairs in a temp folder.
+One reads the other's registry, starts a process there, is pushed its `join`,
+stops it through the other's change lane, is pushed its `leave`, and runs a
+line channel both ways. A third, untrusted key is refused, and so is a server
+that cannot prove its key.
+
+What it costs is the wire. TCP loopback is 30–50 µs against the ring's
+0.5–2 µs, so anything remote pays roughly 30× before it leaves the box, plus
+the network itself.
 
 ## Hardening
 
@@ -700,13 +795,21 @@ three of them found bugs on the way. What is honestly left:
   the id range. Duplicates stay at zero — nothing is ever handed out twice —
   but "reserved and lost" is a state the caller cannot distinguish from
   "never reserved". A two-phase reservation would close it.
-- **More than one machine.** Not a gap — a boundary. See above.
+- **More than one machine, as one segment.** Not a gap but a boundary.
+  `sub-net` makes a machine's registry, process control and events reachable
+  from another, but each machine still has its own segment, and a count or a
+  blob on one is not on the other. See *Another machine*.
+- **A slow handshake holds the door.** `sub-net serve` authenticates callers
+  one at a time, with a 5-second limit on each, so a caller that stalls
+  mid-handshake delays the next for up to that long. Only machines on the
+  private link can reach it at all.
 
 ## Sizes
 
 ```
 bin/dbd          77K    the owner
 bin/sub          34K    register, list and stop what you run
+bin/net         120K    sub-net: this machine's substrate, reachable from another
 bin/gui          58K    a native Cocoa window
 bin/top          78K    the dashboard
 bin/swiftpeer    57K    a second compiled toolchain
@@ -726,6 +829,7 @@ the executable*.
 | | macOS | Linux |
 |---|---|---|
 | `dbd` `webd` `look` `layout` `bench` `peer` | yes | yes |
+| `sub-net` (`bin/net`) | yes | yes (pthreads, `-pthread`) |
 | `gui` `top` | yes (Cocoa) | no — `bin/peer` runs the same checks |
 | `swiftpeer` | if `swiftc` is present | if `swiftc` is present |
 | `pypeer.py` | libSystem atomics | libatomic atomics |
@@ -742,6 +846,12 @@ The segment is **67,141,632 bytes on both**, byte for byte, and both compute
 the same magic. That is asserted in CI, not just printed: if the two ever
 disagreed, a Linux peer and a macOS peer would read different fields out of
 the same bytes.
+
+## Releases
+
+[CHANGELOG.md](CHANGELOG.md), [FEATURES.md](FEATURES.md) and one page per
+release in [docs/releases/](docs/releases/INDEX.md). The latest is
+[0.2.0, another machine](docs/releases/v0.2.0.md).
 
 ## Licence
 
