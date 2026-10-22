@@ -1318,6 +1318,9 @@ static int usage(void) {
       "        Past --timeout (default %ds) its process group is killed, it is\n"
       "        logged timed-out (exit 124), and the next change runs. enable,\n"
       "        disable, stop and restart go through the same lane.\n"
+      "  sub net VERB ...  |  sub keygen\n"
+      "        This machine's substrate, reachable from the machines it trusts:\n"
+      "        sub-net serve, ps, run, stop, events, listen, connect (sub-net --help).\n"
       "  sub changes [--last N] [--json] | --running\n"
       "        The change log, or the change running now and the queue behind it.\n"
       "        Lane: $SUB_LANE, else ~/Library/Application Support/substrate/changes.\n"
@@ -1328,8 +1331,26 @@ static int usage(void) {
     return 0;
 }
 
+/* sub net VERB ... and sub keygen: the network adapter is its own binary
+ * (it needs threads; sub does not), found beside this one. */
+static int do_net(char **argv) {
+    char me[PATH_MAX], tool[PATH_MAX + 16];
+    my_exe(me, sizeof me, "sub");
+    char *slash = strrchr(me, '/');
+    if (slash) *slash = 0;
+    const char *names[] = { "sub-net", "net" };
+    for (int k = 0; k < 2; k++) {
+        snprintf(tool, sizeof tool, "%s/%s", slash ? me : ".", names[k]);
+        if (access(tool, X_OK) == 0) { argv[0] = tool; execv(tool, argv); }
+    }
+    fprintf(stderr, "sub: no sub-net beside %s\n", slash ? me : "this sub");
+    return 127;
+}
+
 int main(int argc, char **argv) {
     if (argc < 2) return usage();
+    if (!strcmp(argv[1], "net") && argc > 2) return do_net(argv + 1);
+    if (!strcmp(argv[1], "keygen")) return do_net(argv);
     if (!strcmp(argv[1], "ps"))   return do_ps();
     if (!strcmp(argv[1], "run"))  return do_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "change"))  return do_change(argc - 2, argv + 2);
