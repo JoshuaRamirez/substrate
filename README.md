@@ -847,6 +847,12 @@ the same magic. That is asserted in CI, not just printed: if the two ever
 disagreed, a Linux peer and a macOS peer would read different fields out of
 the same bytes.
 
+## Releases
+
+[CHANGELOG.md](CHANGELOG.md), [FEATURES.md](FEATURES.md) and one page per
+release in [docs/releases/](docs/releases/INDEX.md). The latest is
+[0.2.0, another machine](docs/releases/v0.2.0.md).
+
 ## Licence
 
 MIT. See [LICENSE](LICENSE).

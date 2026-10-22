@@ -31,11 +31,15 @@ EA="env SUB_SHM=$SHA SUB_NET_DIR=$A" EB="env SUB_SHM=$SHB SUB_NET_DIR=$B"
 # wait until a file holds a line matching a pattern (3 s at most)
 waitline(){ for _ in $(seq 1 60); do grep -qs -- "$2" "$1" && return 0; sleep 0.05; done; return 1; }
 PIDS=""
+# On every way out, pass or fail: stop what the test started, then take its
+# folder with it -- the throwaway key pairs are the test's, and stay its.
 cleanup(){
   for p in $PIDS; do kill "$p" 2>/dev/null; done
   asA "$DBD" --stop >/dev/null 2>&1; asB "$DBD" --stop >/dev/null 2>&1
+  case "$T" in /tmp/subnet.*) rm -rf "$T" ;; esac
 }
 trap cleanup EXIT
+trap 'exit 130' INT TERM
 
 echo "24. the network adapter: two substrates, one connection, live"
 
@@ -155,6 +159,4 @@ done
 check "no secret key appears in any log or output" "$LEAK" "0"
 check "nothing key-shaped was written into the repo" "$(git status --porcelain 2>/dev/null | grep -c -e 'key' -e 'peers')" "0"
 
-cleanup; trap - EXIT
-mv "$T" "$T.done" 2>/dev/null
 [ $fail -eq 0 ] && exit 0 || exit 1
