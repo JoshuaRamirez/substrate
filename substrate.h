@@ -848,4 +848,68 @@ static inline const char *sub_mode(substrate *c) {
     return c->detached ? "detached" : "joined";
 }
 
+/* ---- the network seam: one machine's substrate, reachable from another ----
+ *
+ * Everything above stops at the edge of one machine, because shared memory
+ * does. Past that edge the boundary is a wire, and a wire needs what memory
+ * never did: a protocol, an identity, and secrecy. So the network is NOT a
+ * second mode of the segment -- no pointer here ever points across it. It is
+ * an adapter in front of a machine's own segment: sub-net serves its registry,
+ * its process control and its events to another machine, and the other side
+ * reads them as messages, never as memory.
+ *
+ * The seam is a transport: something that carries whole frames between two
+ * authenticated machines over one persistent connection. net.c fills it with
+ * the one transport this repo ships (Noise IK over TCP: X25519, ChaCha20-
+ * Poly1305, SHA-256, each machine known by its key). Another transport -- a
+ * different cipher suite, a serial line, a QUIC stream -- is another struct of
+ * these pointers, and nothing above it changes.
+ *
+ * A transport promises four things, and the protocol above it relies on all of
+ * them: a frame arrives whole or not at all, in order, from the machine whose
+ * key accept() named, and nobody between the two machines reads it.
+ *
+ * On top of it, every frame is ONE JSON object (the protocol, net.c):
+ *
+ *   ask      {"id":N,"op":"ps"}                        the registry's rows
+ *            {"id":N,"op":"run","name":..,"role":..,"argv":[..]}
+ *            {"id":N,"op":"stop","name":..,"force":false}
+ *            {"id":N,"op":"enable","args":[..]}  {"id":N,"op":"disable","name":..}
+ *            {"id":N,"op":"events"}                    subscribe: pushed, not polled
+ *            {"id":N,"op":"connect","chan":"warp"}     a named line channel
+ *   answer   {"id":N,"ok":true,...}  or  {"id":N,"ok":false,"error":".."}
+ *   pushed   {"seq":S,"ev":"join"|"leave"|"update"|"ops"|"count"|"registry",..}
+ *   channel  {"chan":"warp","msg":<one JSON value>}  and  {"chan":"warp","closed":true}
+ *
+ * Events carry their own sequence (seq, one per serving machine, gapless per
+ * subscriber) plus the segment's own clocks at that moment -- `count`, the
+ * bump counter, and `next_id`, the ring's id space -- so a reader can order
+ * them against anything else it learned from that machine. */
+
+#define SUB_NET_FRAME_MAX 65519          /* a Noise message is 65535, less its 16-byte tag */
+#define SUB_NET_PORT      7341
+#define SUB_NET_NAMELEN   32
+
+typedef struct sub_net_conn     sub_net_conn;      /* the transport's own */
+typedef struct sub_net_listener sub_net_listener;
+
+typedef struct {
+    const char *name;
+    /* Listen on exactly the one address given ("10.0.0.2:7341", "[fd7a::1]:7341").
+     * A wildcard or public address is refused: this is the private link's. */
+    sub_net_listener *(*listen)(const char *addr, char *err, size_t errcap);
+    int  (*listen_fd)(sub_net_listener *l);       /* for poll(); readable = a caller */
+    /* Authenticate one caller. `peer` gets the name its key is trusted under. */
+    sub_net_conn *(*accept)(sub_net_listener *l, char *peer, size_t peercap,
+                            char *err, size_t errcap);
+    /* Reach the machine trusted under `peer`, and prove it holds its key. */
+    sub_net_conn *(*dial)(const char *peer, char *err, size_t errcap);
+    int  (*send)(sub_net_conn *c, const void *msg, size_t len);   /* 0, or -1: closed */
+    long (*recv)(sub_net_conn *c, void *buf, size_t cap);        /* bytes; 0 closed; <0 error */
+    int  (*fd)(sub_net_conn *c);                  /* for poll(); readable = a frame is coming */
+    void (*shutdown)(sub_net_conn *c);            /* wake a blocked recv; frees nothing */
+    void (*close)(sub_net_conn *c);
+    void (*close_listener)(sub_net_listener *l);
+} sub_net_transport;
+
 #endif
