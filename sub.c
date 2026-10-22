@@ -1392,6 +1392,7 @@ int main(int argc, char **argv) {
         }
         return do_stop(argv[2 + force], force);
     }
+    if (!strcmp(argv[1], "--version")) { printf("sub %s (format v%u)\n", SUB_RELEASE, SUB_VERSION); return 0; }
     if (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h") || !strcmp(argv[1], "help"))
         return usage();
     fprintf(stderr, "sub: unknown verb '%s' (try: sub --help)\n", argv[1]);

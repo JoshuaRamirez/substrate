@@ -1770,6 +1770,8 @@ static int do_events(int argc, char **argv) {
     char *ans = ask(c, &req);
     free(req.p);
     if (!ans || answer_failed(ans)) { free(ans); T->close(c); return 3; }
+    /* On stderr, so stdout stays pure events: from here on, nothing is missed. */
+    fprintf(stderr, "sub-net: subscribed to %s's events after seq %lld\n", argv[0], j_num(ans, "seq", 0));
     free(ans);
     setvbuf(stdout, NULL, _IOLBF, 0);
     char *buf = malloc(SUB_NET_FRAME_MAX + 1);
@@ -2053,7 +2055,7 @@ static int do_selftest(void) {
 
 static int usage(void) {
     printf(
-      "sub-net -- this machine's substrate, reachable from the machines it trusts\n"
+      "sub-net %s -- this machine's substrate, reachable from the machines it trusts\n"
       "\n"
       "  sub-net keygen [--force]       make this machine's key pair (in the net folder)\n"
       "  sub-net trust NAME KEY.PUB [--at ADDRESS:PORT]\n"
@@ -2076,7 +2078,7 @@ static int usage(void) {
       "                                 a channel there: stdin lines out, its lines in\n"
       "  sub-net selftest               every primitive against its RFC vectors\n"
       "\n"
-      "Transport: %s. Net folder: $SUB_NET_DIR, else ", T->name);
+      "Transport: %s. Net folder: $SUB_NET_DIR, else ", SUB_RELEASE, T->name);
     char d[PATH_MAX]; net_dir(d, sizeof d);
     printf("%s.\nThe segment served is $SUB_SHM, else %s.\n", d, SUB_SHM_NAME);
     return 0;
@@ -2099,6 +2101,7 @@ int main(int argc, char **argv) {
     if (!strcmp(v, "connect"))  return do_connect(argc - 2, argv + 2);
     if (!strcmp(v, "listen"))   return do_listen(argc - 2, argv + 2);
     if (!strcmp(v, "selftest")) return do_selftest();
+    if (!strcmp(v, "--version")) { printf("sub-net %s (format v%u, %s)\n", SUB_RELEASE, SUB_VERSION, T->name); return 0; }
     if (!strcmp(v, "--help") || !strcmp(v, "-h") || !strcmp(v, "help")) return usage();
     fprintf(stderr, "sub-net: unknown verb '%s' (try: sub-net --help)\n", v);
     return 2;

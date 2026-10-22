@@ -70,6 +70,9 @@ static inline const char *sub_shm_name(void) {
     const char *e = getenv("SUB_SHM");
     return (e && e[0] == '/' && e[1] && strlen(e) < 31) ? e : SUB_SHM_NAME;
 }
+/* The release, which is not the format: SUB_VERSION below pins the bytes of the
+ * segment, and changes only when they do. This counts what ships. */
+#define SUB_RELEASE   "0.2.0"
 #define SUB_MAGIC     0x53554238u    /* "SUB8" */
 #define SUB_VERSION   8u             /* pin the FORMAT, not the binary */
 #define SUB_MAX_PEERS 256            /* was 16, which silently capped contention

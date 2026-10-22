@@ -22,9 +22,12 @@ A="$T/a" B="$T/b" C="$T/c"
 mkdir -p "$A" "$B" "$C"
 SHA=/sub.na.$$ SHB=/sub.nb.$$
 PA=$((20000 + $$ % 20000)) PB=$((20001 + $$ % 20000))
-# run a command as machine A or machine B: its own segment, its own net folder
-asA(){ SUB_SHM=$SHA SUB_NET_DIR="$A" "$@"; }
-asB(){ SUB_SHM=$SHB SUB_NET_DIR="$B" "$@"; }
+# run a command as machine A or machine B: its own segment, its own net folder.
+# A function would put a background job in a subshell, and $! would name the
+# subshell rather than the process, so cleanup would miss it: env execs.
+asA(){ env SUB_SHM=$SHA SUB_NET_DIR="$A" "$@"; }
+asB(){ env SUB_SHM=$SHB SUB_NET_DIR="$B" "$@"; }
+EA="env SUB_SHM=$SHA SUB_NET_DIR=$A" EB="env SUB_SHM=$SHB SUB_NET_DIR=$B"
 # wait until a file holds a line matching a pattern (3 s at most)
 waitline(){ for _ in $(seq 1 60); do grep -qs -- "$2" "$1" && return 0; sleep 0.05; done; return 1; }
 PIDS=""
@@ -60,11 +63,11 @@ SUB_NET_DIR="$T/nokeys" "$NET" serve --bind 127.0.0.1:$PB >/dev/null 2>&1
 check "serve refuses to start without a key pair" "$?" "3"
 
 # -- two substrates ------------------------------------------------------------
-( cd "$A" && asA exec "$DBD" "$A/db" > "$A/dbd.log" 2>&1 ) & PIDS="$PIDS $!"
-( cd "$B" && asB exec "$DBD" "$B/db" > "$B/dbd.log" 2>&1 ) & PIDS="$PIDS $!"
+( cd "$A" && exec $EA "$DBD" "$A/db" > "$A/dbd.log" 2>&1 ) & PIDS="$PIDS $!"
+( cd "$B" && exec $EB "$DBD" "$B/db" > "$B/dbd.log" 2>&1 ) & PIDS="$PIDS $!"
 waitline "$A/dbd.log" "owning" && waitline "$B/dbd.log" "owning"
-asA "$NET" serve --bind 127.0.0.1:$PA > "$A/net.log" 2>&1 & PIDS="$PIDS $!"
-asB "$NET" serve --bind 127.0.0.1:$PB > "$B/net.log" 2>&1 & PIDS="$PIDS $!"
+$EA "$NET" serve --bind 127.0.0.1:$PA > "$A/net.log" 2>&1 & PIDS="$PIDS $!"
+$EB "$NET" serve --bind 127.0.0.1:$PB > "$B/net.log" 2>&1 & PIDS="$PIDS $!"
 waitline "$A/net.log" "serving" && waitline "$B/net.log" "serving"
 check "both sides serve on loopback" "$(grep -c serving "$A/net.log") $(grep -c serving "$B/net.log")" "1 1"
 
@@ -78,10 +81,12 @@ check "B reads A's the same way, over its own connection" \
       "$(asB "$NET" ps a | awk '$2=="dbd"{n++} END{print n+0}')" "1"
 
 # -- events, pushed -----------------------------------------------------------
-asA "$NET" events b > "$T/events.jsonl" 2>"$T/events.err" & EV=$!; PIDS="$PIDS $EV"
-sleep 0.3
-check "the event stream is one persistent connection, held open" \
-      "$(( $(grep -c 'a connected' "$B/net.log") - $(grep -c 'a disconnected' "$B/net.log") ))" "1"
+$EA "$NET" events b > "$T/events.jsonl" 2>"$T/events.err" & EV=$!; PIDS="$PIDS $EV"
+# held open: B has one more connect than disconnect while it streams
+held(){ echo $(( $(grep -c 'a connected' "$B/net.log") - $(grep -c 'a disconnected' "$B/net.log") )); }
+waitline "$T/events.err" "subscribed to b"
+check "A is subscribed to B's events" "$(grep -c 'subscribed to b' "$T/events.err")" "1"
+check "the event stream is one persistent connection, held open" "$(held)" "1"
 
 # -- process control, across --------------------------------------------------
 R=$(asA "$NET" run b --name sleeper --role worker -- sleep 300 2>&1)
@@ -101,6 +106,9 @@ check "a bump on B's segment is pushed as a count event" \
 
 asA "$NET" stop b sleeper > "$T/stop.out" 2>&1
 check "A stops it on B" "$?" "0"
+# gone means reaped: until its `sub run` wrapper (which polls every 500 ms)
+# collects it, a stopped service is a zombie, and kill -0 still answers
+for _ in $(seq 1 60); do kill -0 "$SPID" 2>/dev/null || break; sleep 0.05; done
 check "it is gone from B" "$(kill -0 "$SPID" 2>/dev/null && echo running || echo gone)" "gone"
 waitline "$T/events.jsonl" '"ev":"leave".*"name":"sleeper"'
 check "B's leave is pushed to A" "$(grep -c '"ev":"leave".*"name":"sleeper"' "$T/events.jsonl")" "1"
@@ -121,7 +129,7 @@ cat > "$T/cell.sh" <<'EOF'
 while IFS= read -r l; do printf '{"event":"placed","in":%s}\n{"done":true}\n' "$l"; done
 EOF
 chmod +x "$T/cell.sh"
-asB "$NET" listen warp -- "$T/cell.sh" > "$T/listen.log" 2>&1 & PIDS="$PIDS $!"
+$EB "$NET" listen warp -- "$T/cell.sh" > "$T/listen.log" 2>&1 & PIDS="$PIDS $!"
 waitline "$B/net.log" "listening on channel warp"
 OUT=$(echo '{"place":"cell-1"}' | asA "$NET" connect b warp --lines 2 2>&1)
 check "a JSON line goes to B's listener and its answers come back" "$OUT" '{"event":"placed","in":{"place":"cell-1"}}
