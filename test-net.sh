@@ -100,8 +100,12 @@ check "and not on A" "$(asA "$SUB" ps | awk '$2=="sleeper"{n++} END{print n+0}')
 SPID=$(asB "$SUB" ps | awk '$2=="sleeper"{print $1}')
 waitline "$T/events.jsonl" '"ev":"join".*"name":"sleeper"'
 check "B's join is pushed to A, live" "$(grep -c '"ev":"join".*"name":"sleeper"' "$T/events.jsonl")" "1"
-check "the pushed event names the service's own pid" \
-      "$(grep '"ev":"join".*"name":"sleeper"' "$T/events.jsonl" | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["pid"])')" "$SPID"
+# `sub run` claims the row with its own pid, then writes the service's. A slow
+# machine (ASan, CI) holds the first still for a scan, so the stream truly says
+# join (wrapper) then update (service): the row's LAST word names the service.
+waitline "$T/events.jsonl" "\"pid\":$SPID,\"name\":\"sleeper\""
+check "the pushed events end on the service's own pid" \
+      "$(grep -E '"ev":"(join|update)".*"name":"sleeper"' "$T/events.jsonl" | tail -1 | python3 -c 'import json,sys; print(json.loads(sys.stdin.readline())["pid"])')" "$SPID"
 
 asB "$PEER" --selftest --join >/dev/null 2>&1        # a bump on B's segment
 waitline "$T/events.jsonl" '"ev":"count"'
