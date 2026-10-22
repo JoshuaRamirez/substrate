@@ -42,6 +42,9 @@ jobs:
           sub ps
           sub ps | awk '$2=="ci"{f=1} END{exit !f}'
           sub stop ci
+          # stopped is not yet unregistered: the row goes when its sub run
+          # wrapper reaps the service, which it polls for every 500 ms
+          for _ in $(seq 1 30); do sub ps | awk '$2=="ci"{f=1} END{exit f}' && break; sleep 0.1; done
           sub ps | awk '$2=="ci"{exit 1}'
           make uninstall PREFIX="$HOME/.local"
           test ! -e "$HOME/.local/bin/sub-dbd"
