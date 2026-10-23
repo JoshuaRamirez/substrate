@@ -1949,17 +1949,53 @@ static int do_trust(int argc, char **argv) {
     FILE *in = fopen(path, "r"), *out = fopen(tmp, "w");
     if (!out) { fprintf(stderr, "sub-net: cannot write %s\n", tmp); if (in) fclose(in); return 1; }
     chmod(tmp, 0600);
+    char hex[65], want[256];
+    hexenc(pk, 32, hex);
+    snprintf(want, sizeof want, "%s %s%s%s\n", name, hex, at ? " " : "", at ? at : "");
     char line[512];
+    int same = 0;
     while (in && fgets(line, sizeof line, in)) {
         char nm[64] = "";
-        if (sscanf(line, "%63s", nm) == 1 && !strcmp(nm, name)) continue;   /* replaced below */
+        if (sscanf(line, "%63s", nm) == 1 && !strcmp(nm, name)) { same |= !strcmp(line, want); continue; }   /* replaced below */
         fputs(line, out);
     }
     if (in) fclose(in);
-    char hex[65]; hexenc(pk, 32, hex);
-    fprintf(out, "%s %s%s%s\n", name, hex, at ? " " : "", at ? at : "");
+    /* Trusting what is already trusted, the same way, changes nothing: a setup
+     * script can run this every time and the file is left as it was. */
+    if (same) {
+        fclose(out); unlink(tmp);
+        printf("sub-net: already trusting %s%s%s\n", name, at ? " at " : "", at ? at : "");
+        return 0;
+    }
+    fputs(want, out);
     if (fclose(out) != 0 || rename(tmp, path) < 0) { fprintf(stderr, "sub-net: cannot write %s\n", path); return 1; }
     printf("sub-net: trusting %s%s%s\n", name, at ? " at " : "", at ? at : "");
+    return 0;
+}
+
+/* Take a machine off the trust list: it can no longer call in, nor be dialled. */
+static int do_untrust(int argc, char **argv) {
+    if (argc < 1) { fprintf(stderr, "usage: sub-net untrust NAME\n"); return 2; }
+    const char *name = argv[0];
+    char path[PATH_MAX], tmp[PATH_MAX + 16];
+    net_file("peers", path, sizeof path);
+    snprintf(tmp, sizeof tmp, "%s.tmp", path);
+    FILE *in = fopen(path, "r");
+    if (!in) { printf("sub-net: %s was not trusted\n", name); return 0; }
+    FILE *out = fopen(tmp, "w");
+    if (!out) { fclose(in); fprintf(stderr, "sub-net: cannot write %s\n", tmp); return 1; }
+    chmod(tmp, 0600);
+    char line[512];
+    int hit = 0;
+    while (fgets(line, sizeof line, in)) {
+        char nm[64] = "";
+        if (sscanf(line, "%63s", nm) == 1 && !strcmp(nm, name)) { hit = 1; continue; }
+        fputs(line, out);
+    }
+    fclose(in);
+    if (!hit) { fclose(out); unlink(tmp); printf("sub-net: %s was not trusted\n", name); return 0; }
+    if (fclose(out) != 0 || rename(tmp, path) < 0) { fprintf(stderr, "sub-net: cannot write %s\n", path); return 1; }
+    printf("sub-net: no longer trusting %s\n", name);
     return 0;
 }
 
@@ -2060,7 +2096,9 @@ static int usage(void) {
       "  sub-net keygen [--force]       make this machine's key pair (in the net folder)\n"
       "  sub-net trust NAME KEY.PUB [--at ADDRESS:PORT]\n"
       "                                 trust a machine; --at is where to reach it\n"
+      "  sub-net untrust NAME           stop trusting it\n"
       "  sub-net peers                  the machines trusted here\n"
+      "  sub-net dir                    where this machine's net folder is\n"
       "  sub-net serve --bind ADDRESS:PORT\n"
       "                                 serve this machine's registry, process control\n"
       "                                 and events on one private address (never 0.0.0.0)\n"
@@ -2091,7 +2129,9 @@ int main(int argc, char **argv) {
     if (!strcmp(v, "serve"))    return do_serve(argc - 2, argv + 2);
     if (!strcmp(v, "keygen"))   return do_keygen(argc - 2, argv + 2);
     if (!strcmp(v, "trust"))    return do_trust(argc - 2, argv + 2);
+    if (!strcmp(v, "untrust"))  return do_untrust(argc - 2, argv + 2);
     if (!strcmp(v, "peers"))    return do_peers();
+    if (!strcmp(v, "dir"))      { char d[PATH_MAX]; net_dir(d, sizeof d); printf("%s\n", d); return 0; }
     if (!strcmp(v, "ps"))       return do_ps(argc - 2, argv + 2);
     if (!strcmp(v, "run"))      return do_run(argc - 2, argv + 2);
     if (!strcmp(v, "stop"))     return do_stop(argc - 2, argv + 2);
