@@ -38,10 +38,14 @@ cleanup(){
 trap cleanup EXIT
 trap 'exit 130' INT TERM
 
-# the stand-in's executor: one argument, a command line, run as the "VM"
+# the stand-in's executor: one argument, a command line, run as the "VM". A
+# clean environment, as SSH gives: nothing of the Mac side's (its SUB_NET_DIR
+# least of all, which would hand the "VM" the Mac's own net folder and key)
+# crosses, only the stand-in's own home, segment and lane.
 cat > "$T/vm-exec" <<EOF
 #!/bin/sh
-exec env HOME="$VM" SUB_SHM="$SHV" SUB_LANE="$VM/lane" sh -c "\$1"
+exec env -i HOME="$VM" PATH="$PATH" USER="\${USER:-}" LOGNAME="\${LOGNAME:-}" \
+     SUB_SHM="$SHV" SUB_LANE="$VM/lane" sh -c "\$1"
 EOF
 chmod +x "$T/vm-exec"
 # a gh that records what it was asked, and remembers the keys it was given
@@ -83,7 +87,9 @@ check "the worker has its own GitHub key, readable only by it" \
       "$(stat -c %a "$VM/.ssh/substrate-worker-github_ed25519" 2>/dev/null || stat -f %Lp "$VM/.ssh/substrate-worker-github_ed25519")" "600"
 check "and uses it for github.com" "$(grep -c 'IdentityFile .*substrate-worker-github_ed25519' "$VM/.ssh/config")" "1"
 check "the worker trusts the Mac, which calls in only" \
-      "$(env HOME="$VM" "$VM/.local/bin/sub-net" peers | awk '$1=="mac"{print $2,$3,$4}')" "(calls in only)"
+      "$("$T/vm-exec" '~/.local/bin/sub-net peers' | awk '$1=="mac"{print $2,$3,$4}')" "(calls in only)"
+check "and the two have keys of their own" \
+      "$(cmp -s "$MAC/key.pub" "$VM/Library/Application Support/substrate/net/key.pub" && echo shared || echo distinct)" "distinct"
 check "the Mac trusts the worker, at the address it serves on" \
       "$(SUB_NET_DIR="$MAC" ./bin/net peers | awk '$1=="vm"{print $2}')" "127.0.0.1:$PORT"
 check "the serve unit binds that one address, and comes back" \
