@@ -11,7 +11,7 @@ segment's format number: `SUB_RELEASE` counts what ships, and `SUB_VERSION`
 A worker node: a Linux machine joined to the Mac as a Substrate worker in
 three idempotent, scripted steps, with the proof `sub-net ps NAME`.
 Baseline 0.2.0 (`afa45a7` on `main`). Commits `afa45a7..` the 0.3.0 merge.
-Tests: COUNTS. Notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+Tests: full suite (test.sh, desk-heavy nice -n 10, macOS): 282 pass, 3 skip (swiftc twice, docker), 0 fail; test-net.sh 33/33; test-worker.sh 24/24. Notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
 
 ### Added
 - `scripts/worker-node/`: `install.sh`, `identity.sh`, `serve.sh` (run on the
