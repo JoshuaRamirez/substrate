@@ -1,6 +1,6 @@
 # Features
 
-What substrate does, as of 0.2.0. Each line names where it lives and what
+What substrate does, as of 0.3.0. Each line names where it lives and what
 proves it. The README tells the story; this is the inventory.
 
 ## The segment (`substrate.h`, format v8)
@@ -83,6 +83,30 @@ proves it. The README tells the story; this is the inventory.
   what Warp Drive cells run through.
 - **Proof**: `test-net.sh`, two substrates on one machine on 127.0.0.1, 33
   checks.
+
+## A worker node (`scripts/worker-node/`, 0.3.0)
+
+- **`join.sh NAME ADDRESS SSH-KEY-PATH`**, run on the Mac: the three steps
+  below on the worker over SSH, the public halves exchanged both ways,
+  `sub-net trust`, read-only GitHub deploy keys (`--deploy-repo`, skipped when
+  already there), and the proof, `sub-net ps NAME`. `--undo NAME` untrusts it.
+  Nothing is installed or started on the Mac.
+- **`install.sh`**: build tools (apt only for what is missing), the repo
+  cloned and built at a ref, `sub`, `sub-net` and `sub-dbd` in `~/.local/bin`,
+  and the worker's own GitHub ed25519 key with a marked `~/.ssh/config` block.
+- **`identity.sh`**: `sub-net keygen` once, and trust of the driving
+  machine's key.pub.
+- **`serve.sh ADDRESS:PORT`**: `substrate-dbd` and `substrate-net` as systemd
+  user units with linger, so they come back after a nightly shutdown;
+  `--undo`.
+- **Every step is idempotent**: it reports `changed: nothing` and touches no
+  file when run on a worker that is already set up.
+- **Key paths only**: no script prints a key value.
+- **`sub-net untrust NAME`**, **`sub-net dir`**, and a `sub-net trust` that
+  leaves an identical entry alone.
+- **Proof**: `test-worker.sh`, the whole join against a stand-in "VM" (a temp
+  HOME with a clean environment, driven by a local executor instead of SSH),
+  run twice.
 
 ## Platforms
 

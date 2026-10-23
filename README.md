@@ -709,6 +709,12 @@ stops it through the other's change lane, is pushed its `leave`, and runs a
 line channel both ways. A third, untrusted key is refused, and so is a server
 that cannot prove its key.
 
+**A worker node.** `scripts/worker-node/join.sh NAME ADDRESS SSH-KEY` makes
+a Linux machine (a VM, the PC under WSL2) a worker the Mac drives, in three
+idempotent steps run over SSH: install, identity and trust, serve (systemd
+user units with linger, so it comes back after a nightly shutdown). Then the
+proof is `sub-net ps NAME`. See [docs/worker-node.md](docs/worker-node.md).
+
 What it costs is the wire. TCP loopback is 30–50 µs against the ring's
 0.5–2 µs, so anything remote pays roughly 30× before it leaves the box, plus
 the network itself.
@@ -851,7 +857,7 @@ the same bytes.
 
 [CHANGELOG.md](CHANGELOG.md), [FEATURES.md](FEATURES.md) and one page per
 release in [docs/releases/](docs/releases/INDEX.md). The latest is
-[0.2.0, another machine](docs/releases/v0.2.0.md).
+[0.3.0, a worker node](docs/releases/v0.3.0.md).
 
 ## Licence
 

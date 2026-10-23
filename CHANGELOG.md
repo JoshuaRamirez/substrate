@@ -6,6 +6,30 @@ Every release of substrate. The format follows
 segment's format number: `SUB_RELEASE` counts what ships, and `SUB_VERSION`
 (8) pins the bytes of the segment.
 
+## [0.3.0] - 2026-10-22
+
+A worker node: a Linux machine joined to the Mac as a Substrate worker in
+three idempotent, scripted steps, with the proof `sub-net ps NAME`.
+Baseline 0.2.0 (`afa45a7` on `main`). Commits `afa45a7..` the 0.3.0 merge.
+Tests: full suite (test.sh, desk-heavy nice -n 10, macOS): 282 pass, 3 skip (swiftc twice, docker), 0 fail; test-net.sh 33/33; test-worker.sh 24/24. Notes: [docs/releases/v0.3.0.md](docs/releases/v0.3.0.md).
+
+### Added
+- `scripts/worker-node/`: `install.sh`, `identity.sh`, `serve.sh` (run on the
+  worker) and `join.sh` (run on the Mac, over SSH or a local executor), with
+  `--undo` for both ends.
+- `sub-net untrust NAME` and `sub-net dir`.
+- `test-worker.sh`, run by `test.sh`: the join against a stand-in, twice.
+- `docs/worker-node.md`: the steps, the join, the undo, the hand-off.
+
+### Changed
+- `sub-net trust` of an entry already trusted the same way leaves the trust
+  list untouched and says `already trusting`.
+
+### Security
+- The setup prints key paths, never key values. Only public halves cross the
+  link. The worker's GitHub key is registered read-only
+  (`--allow-write=false`). Nothing is installed or started on the Mac.
+
 ## [0.2.0] - 2026-10-22
 
 Another machine: each machine's registry, process control and events are
@@ -49,5 +73,6 @@ table, ring, arena, blob store, admin token and live database path; `dbd`,
 `change` / `changes`), `webd`, `look`, `layout`, `bench`, `gui`, `top`,
 `peer`, `pypeer.py` and `swiftpeer`; macOS and Linux. Full suite: 224 pass.
 
+[0.3.0]: docs/releases/v0.3.0.md
 [0.2.0]: docs/releases/v0.2.0.md
 [0.1.0]: docs/releases/INDEX.md
