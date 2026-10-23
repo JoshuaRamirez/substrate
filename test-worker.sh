@@ -69,7 +69,7 @@ state(){
   ( cd "$T" && shasum vm/.local/bin/sub vm/.local/bin/sub-net vm/.local/bin/sub-dbd \
       vm/.ssh/substrate-worker-github_ed25519 vm/.ssh/substrate-worker-github_ed25519.pub vm/.ssh/config \
       vm/.config/systemd/user/substrate-dbd.service vm/.config/systemd/user/substrate-net.service \
-      "vm/Library/Application Support/substrate/net/key" "vm/Library/Application Support/substrate/net/peers" \
+      "$VMNET/key" "$VMNET/peers" \
       vm/.local/share/substrate/net.pid vm/.local/share/substrate/dbd.pid \
       mac/key mac/peers mac/workers/vm/key.pub mac/workers/vm/github.pub 2>&1 )
 }
@@ -77,6 +77,8 @@ state(){
 # -- the first join --------------------------------------------------------------
 join > "$T/join1.out" 2>&1
 check "the join runs all three steps and succeeds" "$?" "0"
+# where the worker keeps its net folder is its own business (macOS and Linux differ): ask it
+VMNET=$("$T/vm-exec" '~/.local/bin/sub-net dir')
 check "the proof: sub-net ps vm, from the Mac, lists the worker's registry owner" \
       "$(awk '$2=="dbd" && $3=="owner"{n++} END{print n+0}' "$T/join1.out")" "1"
 check "install put sub, sub-net and sub-dbd in the worker's ~/.local/bin" \
@@ -89,7 +91,7 @@ check "and uses it for github.com" "$(grep -c 'IdentityFile .*substrate-worker-g
 check "the worker trusts the Mac, which calls in only" \
       "$("$T/vm-exec" '~/.local/bin/sub-net peers' | awk '$1=="mac"{print $2,$3,$4}')" "(calls in only)"
 check "and the two have keys of their own" \
-      "$(cmp -s "$MAC/key.pub" "$VM/Library/Application Support/substrate/net/key.pub" && echo shared || echo distinct)" "distinct"
+      "$(cmp -s "$MAC/key.pub" "$VMNET/key.pub" && echo shared || echo distinct)" "distinct"
 check "the Mac trusts the worker, at the address it serves on" \
       "$(SUB_NET_DIR="$MAC" ./bin/net peers | awk '$1=="vm"{print $2}')" "127.0.0.1:$PORT"
 check "the serve unit binds that one address, and comes back" \
@@ -113,7 +115,7 @@ check "and the proof still holds" "$(awk '$2=="dbd" && $3=="owner"{n++} END{prin
 
 # -- key paths, never key values -------------------------------------------------------
 LEAK=0
-for k in "$VM/.ssh/substrate-worker-github_ed25519" "$VM/Library/Application Support/substrate/net/key" "$MAC/key"; do
+for k in "$VM/.ssh/substrate-worker-github_ed25519" "$VMNET/key" "$MAC/key"; do
   # the secret's body lines, one at a time: none may appear in anything the join said
   grep -v -e '^-----' "$k" | while IFS= read -r l; do grep -qsF -- "$l" "$T/join1.out" "$T/join2.out" && echo leak; done | grep -q leak && LEAK=1
 done
