@@ -72,7 +72,7 @@ static inline const char *sub_shm_name(void) {
 }
 /* The release, which is not the format: SUB_VERSION below pins the bytes of the
  * segment, and changes only when they do. This counts what ships. */
-#define SUB_RELEASE   "0.3.0"
+#define SUB_RELEASE   "0.3.1"
 #define SUB_MAGIC     0x53554238u    /* "SUB8" */
 #define SUB_VERSION   8u             /* pin the FORMAT, not the binary */
 #define SUB_MAX_PEERS 256            /* was 16, which silently capped contention

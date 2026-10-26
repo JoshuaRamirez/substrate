@@ -6,6 +6,19 @@ Every release of substrate. The format follows
 segment's format number: `SUB_RELEASE` counts what ships, and `SUB_VERSION`
 (8) pins the bytes of the segment.
 
+## [0.3.1] - 2026-10-26
+
+The desk host (Notification-Hub 0.3.0, "the desk is one app"): while the
+desk's manifest exists (`DESK_HOST_MANIFEST`, else
+`~/Obsidian/Desk-Core/Meta/Machine/desk.yaml`), `sub enable`, `sub disable`
+and `sub restart` exec `desk-host` with the same arguments: a row in the
+manifest and a line to Desk.app instead of a launchd agent. `sub ps`, `sub
+run`, `sub stop`, `sub change(s)` are unchanged; the registry runs as the
+app's first child. `--launchd` on any of the three (or `SUB_LAUNCHD=1`) is
+the way back to the launchd agent as before; the flag survives the change
+lane's re-exec. The test suite's throwaway HOME never sees a manifest, so
+its launchd checks run as they did.
+
 ## [0.3.0] - 2026-10-22
 
 A worker node: a Linux machine joined to the Mac as a Substrate worker in

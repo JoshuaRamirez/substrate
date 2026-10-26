@@ -1277,6 +1277,54 @@ static int do_changes(int argc, char **argv) {
     return 0;
 }
 
+/* ---- the desk host (cut 4 of "the desk is one app", 2026-10-26) ----
+ * While the desk's manifest exists (DESK_HOST_MANIFEST, else
+ * ~/Obsidian/Desk-Core/Meta/Machine/desk.yaml), enable, disable and
+ * restart are the host's: a row in the manifest and a line to Desk.app,
+ * through `desk-host`. `sub ps` is unchanged (the registry's shared
+ * memory; the registry runs as the app's first child). The way back for
+ * one module is `--launchd` (or SUB_LAUNCHD=1): the launchd agent as
+ * before. */
+static int host_manifest_present(void) {
+    const char *e = getenv("SUB_LAUNCHD");
+    if (e && *e && strcmp(e, "0")) return 0;
+    const char *m = getenv("DESK_HOST_MANIFEST");
+    char buf[PATH_MAX];
+    if (!m || !*m) {
+        const char *h = getenv("HOME");
+        snprintf(buf, sizeof buf, "%s/Obsidian/Desk-Core/Meta/Machine/desk.yaml", h ? h : "");
+        m = buf;
+    }
+    return access(m, F_OK) == 0;
+}
+/* The flag is stripped and SUB_LAUNCHD=1 set in the environment, so the
+ * re-exec through the change lane (through_lane runs `sub enable …` again
+ * inside the change) keeps the choice. */
+static int strip_launchd_flag(int argc, char **argv) {
+    int found = 0, w = 0;
+    for (int r = 0; r < argc; r++) {
+        if (!found && !strcmp(argv[r], "--launchd")) { found = 1; continue; }
+        argv[w++] = argv[r];
+    }
+    argv[w] = NULL;
+    if (found) setenv("SUB_LAUNCHD", "1", 1);
+    return found;
+}
+static int to_desk_host(const char *verb, int argc, char **argv) {
+    enum { MAXV = 256 };
+    char *nv[MAXV + 3];
+    char v0[] = "desk-host", v1[32];
+    if (argc > MAXV) argc = MAXV;
+    snprintf(v1, sizeof v1, "%s", verb);
+    nv[0] = v0; nv[1] = v1;
+    for (int i = 0; i < argc; i++) nv[2 + i] = argv[i];
+    nv[2 + argc] = NULL;
+    execvp("desk-host", nv);
+    fprintf(stderr, "sub: desk-host is not on the PATH (the manifest exists, so %s is the host's); "
+                    "pass --launchd for the launchd agent as before\n", verb);
+    return 127;
+}
+
 static int usage(void) {
     printf(
       "sub -- register and manage the things you run on this machine\n"
@@ -1302,7 +1350,11 @@ static int usage(void) {
       "        --no-restart: a login app -- started at login, not started\n"
       "        again when it exits (you quit it on purpose).\n"
       "        macOS only.\n"
-      "  sub disable NAME\n"
+      "        While the desk's manifest exists (Desk-Core Meta/Machine/\n"
+      "        desk.yaml), enable, disable and restart are the desk host's:\n"
+      "        a row in the manifest and a line to Desk.app (desk-host).\n"
+      "        --launchd (or SUB_LAUNCHD=1): the launchd agent as before.\n"
+      "  sub disable [--launchd] NAME\n"
       "        Stop it starting at login and remove its agent.\n"
       "  sub enabled\n"
       "        List what is set to start at login.\n"
@@ -1355,8 +1407,16 @@ int main(int argc, char **argv) {
     if (!strcmp(argv[1], "run"))  return do_run(argc - 2, argv + 2);
     if (!strcmp(argv[1], "change"))  return do_change(argc - 2, argv + 2);
     if (!strcmp(argv[1], "changes")) return do_changes(argc - 2, argv + 2);
-    if (!strcmp(argv[1], "restart")) return do_restart(argc - 2, argv + 2);
+    if (!strcmp(argv[1], "restart")) {
+        int launchd_flag = strip_launchd_flag(argc - 2, argv + 2);
+        if (launchd_flag) argc--;
+        if (!launchd_flag && host_manifest_present()) return to_desk_host("restart", argc - 2, argv + 2);
+        return do_restart(argc - 2, argv + 2);
+    }
     if (!strcmp(argv[1], "enable")) {
+        int launchd_flag = strip_launchd_flag(argc - 2, argv + 2);
+        if (launchd_flag) argc--;
+        if (!launchd_flag && host_manifest_present()) return to_desk_host("enable", argc - 2, argv + 2);
         if (!inside_change() && argc > 2) {
             /* what: "enable NAME", NAME as do_enable would choose it */
             const char *nm = NULL;
@@ -1373,7 +1433,10 @@ int main(int argc, char **argv) {
     }
     if (!strcmp(argv[1], "enabled")) return do_enabled();
     if (!strcmp(argv[1], "disable")) {
-        if (argc < 3) { fprintf(stderr, "usage: sub disable NAME\n"); return 2; }
+        int launchd_flag = strip_launchd_flag(argc - 2, argv + 2);
+        if (launchd_flag) argc--;
+        if (argc < 3) { fprintf(stderr, "usage: sub disable [--launchd] NAME\n"); return 2; }
+        if (!launchd_flag && host_manifest_present()) return to_desk_host("disable", argc - 2, argv + 2);
         if (!inside_change()) {
             char what[200]; snprintf(what, sizeof what, "disable %s", argv[2]);
             return through_lane(argc, argv, what, NULL);
