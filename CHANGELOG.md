@@ -6,6 +6,23 @@ Every release of substrate. The format follows
 segment's format number: `SUB_RELEASE` counts what ships, and `SUB_VERSION`
 (8) pins the bytes of the segment.
 
+## [0.3.2] - 2026-11-03
+
+### Changed
+
+- `sub run` starts its child at nice 10 by default. Background work runs at
+  low priority so the foreground stays responsive (his rule, 2026-10-19
+  03:58), and a renice by hand was undone by the service's next restart (Desk
+  Health, #m1103-1505-2f69: 18 watchers found at nice 0, roster-watch at 85%).
+  `--role app` (a login app used on screen) keeps 0. `--nice N` (0-20), else
+  `SUB_NICE` in the environment, overrides; a desk manifest row's `env:` map
+  and `sub enable --env SUB_NICE=N` both reach it, so neither the desk host
+  nor the plist needs a new key. The nice is only ever raised: a wrapper
+  started nicer (`nice -n 15 sub run ...`) keeps its own. A row whose command
+  is itself `/usr/bin/nice -n 10 ...` adds on top (to 20, the floor).
+  Running services pick it up at their next restart; nothing is restarted.
+  test.sh section 21: seven new checks.
+
 ## [0.3.1] - 2026-10-26
 
 The desk host (Notification-Hub 0.3.0, "the desk is one app"): while the

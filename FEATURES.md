@@ -32,6 +32,10 @@ proves it. The README tells the story; this is the inventory.
   agents, timers, login apps), `restart`, `change` / `changes` (the
   system-change lane: one change at a time, in arrival order, logged),
   `net …` and `keygen` (hand off to sub-net), `--version`.
+- **What `sub run` starts runs at low priority** (0.3.2): nice 10 by default,
+  0 for `--role app` (a login app he uses on screen); `--nice N`, else
+  `SUB_NICE`, overrides (a manifest row's `env:` or `sub enable --env` reaches
+  it). Only ever raised, so a wrapper started nicer keeps its own. (test.sh 21)
 - **`sub-net`** (`bin/net`), new in 0.2.0: below.
 - **`webd`** (`sub-webd`): HTTP over the segment, with the embedded
   1,000,000-record table and the admin routes.

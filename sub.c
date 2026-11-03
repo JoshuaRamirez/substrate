@@ -28,6 +28,7 @@
 #include <stdarg.h>
 #include <sys/file.h>
 #include <sys/time.h>
+#include <sys/resource.h>
 #include <dirent.h>
 #if defined(__APPLE__)
 #include <mach-o/dyld.h>
@@ -180,9 +181,45 @@ static int do_stop(const char *who, int force) {
 
 /* ---- sub run ---- */
 
+/* What sub runs is background work: watchers, servers, timers. His rule
+ * (2026-10-19 03:58) is that background work runs at low priority so his
+ * foreground stays responsive, and a renice by hand is undone by the next
+ * restart -- so the runner sets it, once, for everything it starts.
+ * Default nice 10; a login app (--role app) is something he uses on screen
+ * and keeps 0. The override, most specific first: --nice N, then SUB_NICE
+ * in the environment (a manifest row's env: map reaches it unchanged). */
+#define SUB_NICE_DEFAULT 10
+
+static int parse_nice(const char *v, int *out) {
+    char *end;
+    if (!v || !*v) return -1;
+    long n = strtol(v, &end, 10);
+    if (*end || n < 0 || n > 20) return -1;
+    *out = (int)n;
+    return 0;
+}
+
+static int nice_for(const char *flag, const char *role, int *out) {
+    if (flag) return parse_nice(flag, out);
+    const char *env = getenv("SUB_NICE");
+    if (env && *env) return parse_nice(env, out);
+    *out = (role && !strcmp(role, "app")) ? 0 : SUB_NICE_DEFAULT;
+    return 0;
+}
+
+/* Raise only. A process started already nicer than this (`nice -n 15 sub
+ * run ...`) keeps its own, and lowering would need root anyway. */
+static void apply_nice(int want) {
+    errno = 0;
+    int cur = getpriority(PRIO_PROCESS, 0);
+    if (errno) cur = 0;
+    if (want > cur && setpriority(PRIO_PROCESS, 0, want) != 0)
+        fprintf(stderr, "sub: cannot set nice %d: %s\n", want, strerror(errno));
+}
+
 static int do_run(int argc, char **argv) {
-    const char *name = NULL, *role = "service";
-    int anyway = 0, i = 0, waitsec = 0;
+    const char *name = NULL, *role = "service", *niceflag = NULL;
+    int anyway = 0, i = 0, waitsec = 0, nicev = 0;
 
     for (i = 0; i < argc; i++) {
         if (!strcmp(argv[i], "--")) { i++; break; }
@@ -190,10 +227,15 @@ static int do_run(int argc, char **argv) {
         else if (!strcmp(argv[i], "--role") && i + 1 < argc) role = argv[++i];
         else if (!strcmp(argv[i], "--anyway")) anyway = 1;
         else if (!strcmp(argv[i], "--wait") && i + 1 < argc) waitsec = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--nice") && i + 1 < argc) niceflag = argv[++i];
         else { fprintf(stderr, "sub run: unknown option %s\n", argv[i]); return 2; }
     }
     if (i >= argc) {
-        fprintf(stderr, "usage: sub run [--name N] [--role R] [--anyway] -- cmd [args]\n");
+        fprintf(stderr, "usage: sub run [--name N] [--role R] [--nice N] [--anyway] -- cmd [args]\n");
+        return 2;
+    }
+    if (nice_for(niceflag, role, &nicev) < 0) {
+        fprintf(stderr, "sub: nice takes a whole number from 0 to 20 (--nice or SUB_NICE)\n");
         return 2;
     }
     if (!name) name = base_of(argv[i]);
@@ -249,6 +291,7 @@ static int do_run(int argc, char **argv) {
         signal(SIGTERM, SIG_DFL);
         signal(SIGINT,  SIG_DFL);
         signal(SIGHUP,  SIG_DFL);
+        apply_nice(nicev);
         execvp(argv[i], &argv[i]);
         fprintf(stderr, "sub: cannot exec %s: %s\n", argv[i], strerror(errno));
         _exit(127);
@@ -1329,11 +1372,14 @@ static int usage(void) {
     printf(
       "sub -- register and manage the things you run on this machine\n"
       "\n"
-      "  sub run [--name N] [--role R] [--anyway] -- cmd [args...]\n"
+      "  sub run [--name N] [--role R] [--nice N] [--anyway] -- cmd [args...]\n"
       "        Run cmd and register it. --name defaults to the command's\n"
       "        basename, --role to \"service\" (both capped at %d chars).\n"
       "        Without a registry running, refuses; --anyway runs anyway.\n"
       "        Exits with the child's exit code.\n"
+      "        cmd runs at nice 10 (background work), 0 for --role app;\n"
+      "        --nice N (0-20), else SUB_NICE, overrides. Only ever raised:\n"
+      "        started nicer than that, it keeps its own.\n"
       "  sub ps\n"
       "        List every registered process. Registers nothing itself.\n"
       "  sub enable [--name N] [--role R] [--dir D] [--nameplate FILE]\n"

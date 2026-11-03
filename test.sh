@@ -509,6 +509,21 @@ check "sub run refuses rather than run unregistered" "$?" "3"
 ./bin/sub run --anyway -- sh -c 'exit 7' >/dev/null 2>&1
 check "--anyway runs it, and passes the exit code back" "$?" "7"
 
+# Background work runs at low priority (his rule, 2026-10-19 03:58), so the
+# runner sets it: nice 10 unless overridden, 0 for a login app, and only ever
+# raised -- this suite may itself be running niced, so want max(base, N).
+BASE=$(ps -o nice= -p $$ | tr -d ' ')
+atleast(){ [ "$1" -gt "$BASE" ] && echo "$1" || echo "$BASE"; }
+nice_of(){ ./bin/sub run --anyway "$@" -- sh -c 'ps -o nice= -p $$' 2>/dev/null | tr -d ' '; }
+check "sub run starts its child at nice 10 by default" "$(nice_of)" "$(atleast 10)"
+check "--nice N sets it"                              "$(nice_of --nice 19)" "$(atleast 19)"
+check "a login app (--role app) keeps its own"        "$(nice_of --role app)" "$BASE"
+check "SUB_NICE overrides the default"                "$(SUB_NICE=17 nice_of)" "$(atleast 17)"
+check "--nice wins over SUB_NICE"                     "$(SUB_NICE=17 nice_of --nice 18)" "$(atleast 18)"
+check "nice is only raised, never lowered"            "$(nice_of --nice 0)" "$BASE"
+./bin/sub run --anyway --nice 21 -- true >/dev/null 2>&1
+check "a nice out of 0-20 is refused"                 "$?" "2"
+
 ./bin/dbd >/dev/null 2>&1 & sleep 0.8
 ./bin/sub run --name t1 -- sh -c 'exit 5' >/dev/null 2>&1
 check "sub run passes a child's exit code through" "$?" "5"
